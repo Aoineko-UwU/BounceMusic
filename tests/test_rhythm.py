@@ -49,7 +49,24 @@ def test_dynamic_responds_to_more_transients():
     _, dynamic, _ = analyze('dynamic')
     assert len(dynamic) > len(fixed)
 
+def test_configured_speed_limit():
+    signal = render(bpm=140)
+    counts = []
+    for limit in (100, 200):
+        tracker = BeatTracker(fast_bpm_threshold=limit)
+        tracker.mode = 'fixed'
+        previous = 0
+        hits = []
+        for i in range(0, len(signal) - CHUNK, CHUNK):
+            beat = tracker.feed(signal[i:i + CHUNK], i / RATE)[2]
+            if beat and beat != previous:
+                hits.append(beat)
+                previous = beat
+        counts.append(len([beat for beat in hits if beat > 12]))
+    assert counts[1] > counts[0] * 1.5
+
 if __name__ == '__main__':
     test_fixed_grid()
     test_dynamic_responds_to_more_transients()
+    test_configured_speed_limit()
     print('Rhythm checks passed.')
