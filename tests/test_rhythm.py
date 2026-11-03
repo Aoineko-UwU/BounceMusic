@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from app import BeatTracker
+from app import BeatTracker, learned_octave_bias
 
 RATE = 48_000
 CHUNK = 1024
@@ -22,11 +22,11 @@ def render(duration=28, bpm=120):
         samples[i:i + len(t)] += .18 * np.sin(2 * np.pi * 400 * t / RATE) * np.exp(-t / 400)
     return samples
 
-def analyze(mode):
-    tracker = BeatTracker(); tracker.mode = mode
+def analyze(tempo=120):
+    tracker = BeatTracker()
     events, locks = [], []
     previous = 0
-    signal = render()
+    signal = render(bpm=tempo)
     for i in range(0, len(signal) - CHUNK, CHUNK):
         bpm, _, beat, _, _, _ = tracker.feed(signal[i:i + CHUNK], i / RATE)
         if tracker.just_locked:
@@ -36,7 +36,7 @@ def analyze(mode):
     return tracker, events, locks
 
 def test_fixed_grid():
-    tracker, events, locks = analyze('fixed')
+    tracker, events, locks = analyze()
     assert 115 < tracker.bpm < 125
     assert len(locks) == 1
     late = [event for event in events if event > 12]
@@ -44,17 +44,17 @@ def test_fixed_grid():
     errors = [abs(((event - .5 + .25) % .5) - .25) for event in late]
     assert np.median(errors) < .08
 
-def test_dynamic_responds_to_more_transients():
-    _, fixed, _ = analyze('fixed')
-    _, dynamic, _ = analyze('dynamic')
-    assert len(dynamic) > len(fixed)
+def test_distinct_songs_keep_independent_tempo():
+    for tempo in (90, 120, 140, 180):
+        tracker, _, locks = analyze(tempo)
+        assert abs(tracker.bpm-tempo)<tempo*.08, (tempo,tracker.bpm)
+        assert len(locks)==1
 
 def test_configured_speed_limit():
     signal = render(bpm=140)
     counts = []
     for limit in (100, 200):
         tracker = BeatTracker(fast_bpm_threshold=limit)
-        tracker.mode = 'fixed'
         previous = 0
         hits = []
         for i in range(0, len(signal) - CHUNK, CHUNK):
@@ -73,17 +73,32 @@ def test_end_silence_threshold_and_reference_bpm():
     assert tracker.feed(np.zeros(CHUNK, dtype=np.float32), 3.1)[4]
     assert tracker.ended_bpm == 120.
 
-def test_tempo_calibration():
-    tracker = BeatTracker(tempo_factor=.5)
-    signal = render()
-    for i in range(0, len(signal) - CHUNK, CHUNK):
-        tracker.feed(signal[i:i + CHUNK], i / RATE)
-    assert 55 < tracker.bpm < 65
+def test_feedback_needs_repeated_evidence():
+    examples=[{'estimated':120,'actual':60,'source':'feedback'}]*3
+    assert learned_octave_bias(examples)==0
+    examples.append({'estimated':120,'actual':60,'source':'feedback'})
+    assert learned_octave_bias(examples)==-1
+    examples.append({'estimated':90,'actual':90,'source':'feedback'})
+    assert learned_octave_bias(examples)==-1
+    examples.extend([{'estimated':100,'actual':100,'source':'feedback'}]*3)
+    assert learned_octave_bias(examples)==0
+
+def test_manual_lock_keeps_current_song_tempo():
+    tracker=BeatTracker()
+    signal=render()
+    for i in range(0, len(signal)//2, CHUNK):
+        tracker.feed(signal[i:i+CHUNK],i/RATE)
+    assert tracker.bpm>0
+    tracker.manual_bpm=110.; tracker.bpm=110.; tracker.align_phase(14.)
+    for i in range(len(signal)//2, len(signal)-CHUNK, CHUNK):
+        tracker.feed(signal[i:i+CHUNK],i/RATE)
+    assert tracker.bpm==110.
 
 if __name__ == '__main__':
     test_fixed_grid()
-    test_dynamic_responds_to_more_transients()
+    test_distinct_songs_keep_independent_tempo()
     test_configured_speed_limit()
     test_end_silence_threshold_and_reference_bpm()
-    test_tempo_calibration()
+    test_feedback_needs_repeated_evidence()
+    test_manual_lock_keeps_current_song_tempo()
     print('Rhythm checks passed.')
