@@ -8,7 +8,7 @@ Windows 11 便携桌面动画程序，监听指定应用进程或播放设备，
 
 ## 下载和使用
 
-`packages/QBounceMusic-v8-portable.zip` 为 Windows x64 便携包，解压后运行 `BounceMusic.exe`；请保留 `_internal` 文件夹。仓库使用 Git LFS 管理压缩包，克隆时请先安装 Git LFS 并执行 `git lfs install`；已有克隆可以执行 `git lfs pull`。
+`packages/BounceMusic-v1.1.0-win64.zip` 为 Windows x64 便携包，解压后运行 `BounceMusic.exe`；请保留 `_internal` 文件夹。仓库使用 Git LFS 管理压缩包，克隆时请先安装 Git LFS 并执行 `git lfs install`；已有克隆可以执行 `git lfs pull`。
 
 网易云音乐：先播放音乐，点击“自动查找网易云”，找到进程后点击“开始监听”。也可以选择其他进程或播放设备。导入透明 PNG 后可以拖动图片、滚轮缩放、设置置顶、帧率、动画幅度和节奏偏移。右键图片或托盘图标可打开设置。
 
