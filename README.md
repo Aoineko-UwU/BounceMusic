@@ -8,7 +8,9 @@ Windows 10/11 x64 便携桌面动画程序，监听播放设备或受支持系�
 
 ## 下载和使用
 
-`packages/BounceMusic-v1.4.1-win64.zip` 为当前 Windows x64 便携包，解压后运行 `BounceMusic.exe`；请保留 `_internal` 文件夹。仓库使用 Git LFS 管理压缩包，克隆时请先安装 Git LFS 并执行 `git lfs install`；已有克隆可以执行 `git lfs pull`。旧版包保留在 `packages/` 中。
+在 [Releases 发布页](https://github.com/Aoineko-UwU/BounceMusic/releases)下载最新或历史版本的 Windows x64 Portable ZIP；解压后运行 `BounceMusic.exe`，请保留 `_internal` 文件夹。各版本更新内容见 [更新记录](CHANGELOG.md)。
+
+便携包也保留在仓库的 `packages/` 中，使用 Git LFS 管理；克隆时请先安装 Git LFS 并执行 `git lfs install`，已有克隆可以执行 `git lfs pull`。
 
 Windows 11 上，网易云音乐可先播放音乐，点击“自动查找网易云”，找到进程后点击“开始监听”；也可以选择其他进程或播放设备。Windows 10 普通客户端版本的单进程捕获接口不可用，程序会选择“播放设备”模式，监听该设备的整体输出音频。主页面可导入图片、调整动画幅度和节奏偏移，并可“刷新 BPM”以重新开始当前音频分析。后台分析 BPM 且检测到音频时，图片右上角显示加载动画；锁定 BPM、暂停或停止音频后消失。
 
