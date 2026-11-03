@@ -65,8 +65,25 @@ def test_configured_speed_limit():
         counts.append(len([beat for beat in hits if beat > 12]))
     assert counts[1] > counts[0] * 1.5
 
+def test_end_silence_threshold_and_reference_bpm():
+    tracker = BeatTracker(end_silence=2.)
+    tracker.bpm = 120.
+    tracker.feed(np.ones(CHUNK, dtype=np.float32) * .01, 1.)
+    assert not tracker.feed(np.zeros(CHUNK, dtype=np.float32), 2.9)[4]
+    assert tracker.feed(np.zeros(CHUNK, dtype=np.float32), 3.1)[4]
+    assert tracker.ended_bpm == 120.
+
+def test_tempo_calibration():
+    tracker = BeatTracker(tempo_factor=.5)
+    signal = render()
+    for i in range(0, len(signal) - CHUNK, CHUNK):
+        tracker.feed(signal[i:i + CHUNK], i / RATE)
+    assert 55 < tracker.bpm < 65
+
 if __name__ == '__main__':
     test_fixed_grid()
     test_dynamic_responds_to_more_transients()
     test_configured_speed_limit()
+    test_end_silence_threshold_and_reference_bpm()
+    test_tempo_calibration()
     print('Rhythm checks passed.')
