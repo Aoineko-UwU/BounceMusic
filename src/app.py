@@ -1,7 +1,7 @@
 import os, sys, time, threading, queue, json, math, traceback
 from collections import deque
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, colorchooser
 import numpy as np
 import pyaudiowpatch as pa
 import pystray
@@ -43,9 +43,12 @@ class BeatTracker:
         self.flux = deque(maxlen=int(20*rate/chunk)); self.history = deque(maxlen=48)
         self.prev = None; self.bpm = 0.; self.level = 0.; self.beat = 0.; self.phase = 0.
         self.last_onset = 0.; self.steps = 0; self.prev_flux = 0.; self.prev_prev_flux = 0.; self.prev_threshold = float('inf')
-        self.tempo_candidates = deque(maxlen=6); self.last_signal = 0.; self.last_visual = -1e9
+        self.tempo_candidates = deque(maxlen=6); self.onsets = deque(maxlen=96)
+        self.last_signal = 0.; self.last_visual = -1e9; self.last_grid = None
+        self.just_locked = False; self.mode = 'fixed'
         self.shape_target = .12; self.shape = .12; self.beat_strength = .8; self.last_time = 0.; self.song_end = False
     def feed(self, x, now):
+        self.just_locked = False
         dt = min(.2, max(.001, now-self.last_time)) if self.last_time else .02
         self.last_time = now
         rms = float(np.sqrt(np.mean(x*x))) if len(x) else 0.
@@ -55,6 +58,7 @@ class BeatTracker:
         elif self.last_signal and now-self.last_signal > 5:
             self.song_end = True
             self.bpm=0.; self.flux.clear(); self.history.clear(); self.tempo_candidates.clear(); self.last_signal=0.
+            self.phase=0.; self.last_grid=None; self.onsets.clear()
             self.shape_target=.12
         # Slowly return toward a slender, tall resting shape between accents.
         self.shape_target += (.12-self.shape_target) * min(1., dt*1.8)
@@ -77,11 +81,17 @@ class BeatTracker:
         if onset:
             self.last_onset = now
             strength = float(np.clip((peak_flux-peak_threshold)/(peak_threshold+1e-6), 0., 3.))
+            self.onsets.append((now, strength))
             # 0 = slender/tall, 1 = broad/flat. Keep this as a continuous state.
             self.shape_target = float(np.clip(.18 + .82*(strength/3.), .18, 1.))
             # Each accepted beat starts a fresh animation cycle; fast tracks skip only beats that would overlap.
-            if now-self.last_visual >= .39:
+            if self.mode == 'dynamic' and now-self.last_visual >= .39:
                 self.beat = now; self.last_visual = now; self.beat_strength = float(np.clip(.45 + .55*(strength/3.), .45, 1.))
+            elif self.mode == 'fixed' and self.bpm and self.phase:
+                period = 60/self.bpm
+                error = (now-self.phase+period/2) % period-period/2
+                if abs(error) < min(.09, period*.18) and strength > .35:
+                    self.phase += error*.12
         if self.steps % max(1, int(1.5*self.rate/self.chunk)) == 0 and len(self.flux)>6*self.rate/self.chunk:
             v = np.asarray(self.flux); v = v - v.mean(); corr = np.correlate(v, v, mode='full')[len(v)-1:]
             lo=int(60*self.rate/(180*self.chunk)); hi=min(len(corr)-2,int(60*self.rate/(70*self.chunk)))
@@ -100,11 +110,38 @@ class BeatTracker:
                         if max(abs(v-median) for v in recent) < median*.06:
                             if not self.bpm or abs(median-self.bpm)>self.bpm*.09:
                                 self.bpm=median; self.tempo_candidates.clear()
+                                self.align_phase(now)
+                                self.last_grid=None; self.just_locked=True
+        if self.mode == 'fixed' and self.bpm and self.phase and self.level > .008 and now-self.last_onset < 2:
+            # At fast tempos use every other grid beat so one full squash cycle can finish.
+            stride = 2 if self.bpm > 150 else 1
+            interval = stride*60/self.bpm
+            index = math.floor((now-self.phase)/interval)
+            if index >= 0 and index != self.last_grid:
+                grid_time = self.phase+index*interval
+                if 0 <= now-grid_time < .09 and grid_time-self.last_visual >= .39:
+                    self.beat=grid_time; self.last_visual=grid_time
+                    self.beat_strength=.8; self.last_grid=index
         return self.bpm, self.level, self.beat, float(np.clip(self.shape, .05, 1.0)), self.song_end, self.beat_strength
 
+    def align_phase(self, now):
+        period=60/self.bpm
+        recent=[(t,s) for t,s in self.onsets if now-t < 12]
+        if not recent: self.phase=now; return
+        # The stronger low-frequency onsets carry more weight than vocals and hi-hats.
+        strengths=np.array([s for _,s in recent]); cutoff=float(np.quantile(strengths,.55))
+        chosen=[(t,s) for t,s in recent if s>=cutoff]
+        angles=np.array([2*math.pi*t/period for t,_ in chosen])
+        weights=np.array([.5+s for _,s in chosen])
+        vector=np.sum(weights*np.exp(1j*angles))
+        if abs(vector) < .15*weights.sum(): self.phase=chosen[-1][0]; return
+        position=(np.angle(vector)%(2*math.pi))/(2*math.pi)*period
+        self.phase=now-((now-position)%period)
+
 class Analyzer:
-    def __init__(self, source, events, analysis_bias=1.0):
+    def __init__(self, source, events, analysis_bias=1.0, beat_mode='fixed'):
         self.source, self.events, self.analysis_bias = source, events, analysis_bias
+        self.beat_mode=beat_mode; self.reset_epoch=0
         self.running = True; self.bpm = 0.; self.level = 0.; self.lastbeat = 0.; self.shape = .12; self.beat_strength = .8; self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.run, daemon=True); self.thread.start()
     def stop(self): self.running = False
@@ -126,9 +163,13 @@ class Analyzer:
                 def callback(data, frame_count, time_info, status):
                     push(data); return (None, pa.paContinue)
                 stream=p.open(format=pa.paFloat32, channels=channels, rate=rate, input=True, input_device_index=idx, frames_per_buffer=chunk, stream_callback=callback)
-            tracker=BeatTracker(rate,chunk,self.analysis_bias); pending=np.empty(0,dtype=np.float32); last_data_time=time.monotonic(); song_end_reported=False
+            tracker=BeatTracker(rate,chunk,self.analysis_bias); pending=np.empty(0,dtype=np.float32); last_data_time=time.monotonic(); song_end_reported=False; seen_epoch=self.reset_epoch
             self.events.put(('status', '正在监听：' + name))
             while self.running:
+                if seen_epoch != self.reset_epoch:
+                    seen_epoch=self.reset_epoch; tracker=BeatTracker(rate,chunk,self.analysis_bias)
+                    pending=np.empty(0,dtype=np.float32); song_end_reported=False
+                    with self.lock: self.bpm=0.; self.lastbeat=0.; self.shape=.12
                 try: data=audio_queue.get(timeout=.2)
                 except queue.Empty:
                     with self.lock: self.level=0
@@ -146,8 +187,12 @@ class Analyzer:
                     frame=pending[:chunk]; pending=pending[chunk:]
                     now=time.monotonic()-len(pending)/rate
                     tracker.analysis_bias=self.analysis_bias
+                    tracker.mode=self.beat_mode
+                    old_bpm=tracker.bpm
                     bpm,level,beat,shape,song_end,beat_strength=tracker.feed(frame,now)
                     with self.lock: self.bpm,self.level,self.lastbeat,self.shape,self.beat_strength=bpm,level,beat,shape,beat_strength
+                    if tracker.just_locked and (not old_bpm or abs(bpm-old_bpm)>old_bpm*.09):
+                        self.events.put(('bpm_locked', bpm))
                     if song_end and not song_end_reported:
                         song_end_reported=True; self.events.put(('song_end', bpm))
                     elif not song_end:
@@ -164,12 +209,18 @@ class Analyzer:
 
 class App:
     def __init__(self):
-        self.root = tk.Tk(); self.root.title('Q弹音乐'); self.root.geometry('570x565'); self.root.resizable(False, False)
+        self.root = tk.Tk(); self.root.title('Q弹音乐'); self.root.geometry('610x720'); self.root.resizable(False, False)
         self.events = queue.Queue(); self.analyzer = None; self.analysis_bias = float(self.config.get('analysis_bias', 1.0)) if hasattr(self, 'config') else 1.0; self.anim_sx = 1.0; self.anim_sy = 1.0; self.last_frame_time = time.monotonic(); self.dev = []; self.sources = []; self.mode = tk.StringVar(value='process'); self.filter_text = tk.StringVar(); self.all_sources = []; self.drag = None; self.tray = None; self.photo = None
         try:
             with open(CONFIG, encoding='utf-8') as f: self.config = json.load(f)
         except Exception: self.config = {}
         self.analysis_bias = float(self.config.get('analysis_bias', 1.0)); self.feedback_enabled = tk.BooleanVar(value=bool(self.config.get('feedback_enabled', False)))
+        self.beat_mode=tk.StringVar(value=self.config.get('beat_mode','fixed'))
+        if self.beat_mode.get() not in ('fixed','dynamic'): self.beat_mode.set('fixed')
+        self.flash_enabled=tk.BooleanVar(value=bool(self.config.get('flash_enabled', False)))
+        self.flash_color=self.config.get('flash_color','#ffffff')
+        self.flash_duration=tk.DoubleVar(value=float(self.config.get('flash_duration',.55)))
+        self.flash_started=-1e9; self.feedback_dialog=None
         self.original = slime(); self.image_path = self.config.get('image', '')
         if self.image_path:
             try: self.original = Image.open(self.image_path).convert('RGBA')
@@ -182,11 +233,15 @@ class App:
         self.win.geometry('+%d+%d' % (self.config.get('x', 800), self.config.get('y', 250)))
         main = ttk.Frame(self.root, padding=16); main.pack(fill='both', expand=True)
         ttk.Label(main, text='Q弹音乐', font=('Microsoft YaHei UI', 18, 'bold')).pack(anchor='w')
-        ttk.Label(main, text='选择音乐软件或播放设备，让图片跟随强弱节奏连续变形。').pack(anchor='w', pady=(2, 8))
+        ttk.Label(main, text='选择音乐软件或播放设备，让图片跟随节奏压扁回弹。').pack(anchor='w', pady=(2, 8))
         modes = ttk.Frame(main); modes.pack(fill='x', pady=(0, 5))
         ttk.Radiobutton(modes, text='指定软件进程', variable=self.mode, value='process', command=self.refresh).pack(side='left')
         ttk.Radiobutton(modes, text='播放设备（系统声音）', variable=self.mode, value='device', command=self.refresh).pack(side='left', padx=14)
         ttk.Button(modes, text='自动查找网易云', command=self.find_netease).pack(side='right')
+        rhythm=ttk.Frame(main); rhythm.pack(fill='x', pady=(1,5))
+        ttk.Label(rhythm,text='节奏模式').pack(side='left')
+        ttk.Radiobutton(rhythm,text='固定 BPM（默认）',variable=self.beat_mode,value='fixed',command=self.set_beat_mode).pack(side='left',padx=(8,2))
+        ttk.Radiobutton(rhythm,text='动态鼓点',variable=self.beat_mode,value='dynamic',command=self.set_beat_mode).pack(side='left',padx=(8,0))
         search = ttk.Frame(main); search.pack(fill='x', pady=(0, 5))
         ttk.Label(search, text='筛选进程名').pack(side='left'); ttk.Entry(search, textvariable=self.filter_text).pack(side='left', fill='x', expand=True, padx=(8,0))
         self.filter_text.trace_add('write', lambda *_: self.apply_filter())
@@ -205,9 +260,18 @@ class App:
         row = ttk.Frame(main); row.pack(fill='x')
         ttk.Label(row, text='节奏偏移').pack(side='left'); tk.Scale(row, variable=self.offset, from_=-.25, to=.25, resolution=.01, orient='horizontal', showvalue=True, length=320).pack(side='left', padx=8); ttk.Label(row, text='秒').pack(side='left')
         ttk.Label(main, text='负值提前（根据稳定节奏预测）；正值延后。', foreground='#666666').pack(anchor='w')
+        flash_row=ttk.Frame(main); flash_row.pack(fill='x',pady=(8,2))
+        ttk.Checkbutton(flash_row,text='BPM 锁定时闪色提示',variable=self.flash_enabled,command=self.save).pack(side='left')
+        ttk.Button(flash_row,text='选择颜色',command=self.choose_flash_color).pack(side='left',padx=8)
+        self.color_preview=tk.Label(flash_row,bg=self.flash_color,width=3,relief='solid',bd=1); self.color_preview.pack(side='left')
+        duration_row=ttk.Frame(main); duration_row.pack(fill='x')
+        ttk.Label(duration_row,text='渐隐时间').pack(side='left')
+        tk.Scale(duration_row,variable=self.flash_duration,from_=.1,to=2.0,resolution=.05,orient='horizontal',length=320).pack(side='left',padx=8)
+        ttk.Label(duration_row,text='秒').pack(side='left')
         ttk.Checkbutton(main, text='启用歌曲结束反馈（播放结束后询问动画是否正确）', variable=self.feedback_enabled, command=self.save).pack(anchor='w', pady=(4, 0))
+        ttk.Button(main,text='清除学习与对轨数据',command=self.clear_analysis_data).pack(anchor='w',pady=(5,0))
         ttk.Label(main, textvariable=self.status, wraplength=470, foreground='#34596a').pack(anchor='w', pady=(10, 0))
-        ttk.Label(main, text='强拍会过渡到扁，轻拍会过渡到瘦高；形变连续衔接，不会每拍重置。拖动图片可移动，滚轮缩放，右键打开设置。', wraplength=500, foreground='#666666').pack(anchor='w', pady=(6, 0))
+        ttk.Label(main, text='固定模式按节拍网格弹跳；动态模式跟随强鼓点。拖动图片可移动，滚轮缩放，右键打开设置。', wraplength=550, foreground='#666666').pack(anchor='w', pady=(6, 0))
         self.root.protocol('WM_DELETE_WINDOW', self.hide_settings); self.refresh(); self.make_tray(); self.tick()
     def find_netease(self):
         self.mode.set('process'); self.filter_text.set('cloudmusic'); self.refresh()
@@ -257,7 +321,7 @@ class App:
         i=self.combo.current()
         if i<0: messagebox.showwarning('音频源','请先选择音频源。'); return
         self.stop(); source=self.sources[i]; mode=self.mode.get()
-        self.analyzer=Analyzer((mode,source),self.events,self.analysis_bias)
+        self.analyzer=Analyzer((mode,source),self.events,self.analysis_bias,self.beat_mode.get())
         self.config['process' if mode=='process' else 'device']=source[1]; self.save()
     def stop(self):
         if self.analyzer: self.analyzer.stop(); self.analyzer = None
@@ -268,14 +332,45 @@ class App:
             try:
                 im = Image.open(path); im.seek(0); self.original = ImageOps.exif_transpose(im).convert('RGBA'); self.image_path = path; self.save()
             except Exception as e: messagebox.showerror('图片读取失败', str(e))
+    def set_beat_mode(self):
+        if self.analyzer:
+            self.analyzer.beat_mode=self.beat_mode.get()
+            self.analyzer.reset_epoch += 1
+        self.save()
+    def choose_flash_color(self):
+        _, chosen=colorchooser.askcolor(color=self.flash_color,parent=self.root,title='选择 BPM 锁定提示颜色')
+        if chosen:
+            self.flash_color=chosen
+            self.color_preview.config(bg=chosen)
+            self.save()
     def song_feedback(self, bpm):
-        answer = messagebox.askyesno('动画是否正确', '这首歌似乎已经播放结束。刚才的动画节奏是否合适？\n\n选择“是”会保持并略微增强当前分析偏好；选择“否”会降低误触发敏感度。')
-        if answer:
-            self.analysis_bias = max(.82, self.analysis_bias - .03);
-            if self.analyzer: self.analyzer.analysis_bias = self.analysis_bias; self.status.set('已记录：动画合适，继续保持当前分析偏好。')
-        else:
-            self.analysis_bias = min(1.45, self.analysis_bias + .08);
-            if self.analyzer: self.analyzer.analysis_bias = self.analysis_bias; self.status.set('已记录：下次将减少弱节奏误触发。')
+        if self.feedback_dialog and self.feedback_dialog.winfo_exists(): return
+        dialog=tk.Toplevel(self.root); self.feedback_dialog=dialog
+        dialog.title('动画效果评价'); dialog.resizable(False,False); dialog.transient(self.root)
+        ttk.Label(dialog,text='检测到一段较长静音。刚才动画的节奏是否合适？',padding=14).pack()
+        buttons=ttk.Frame(dialog,padding=(12,0,12,12)); buttons.pack()
+        def rate(label,adjust):
+            counts=self.config.setdefault('feedback_counts',{})
+            counts[label]=int(counts.get(label,0))+1
+            self.analysis_bias=float(np.clip(self.analysis_bias+adjust,.8,1.5))
+            if self.analyzer: self.analyzer.analysis_bias=self.analysis_bias
+            self.status.set('已记录评价：'+label)
+            self.save(); dialog.destroy(); self.feedback_dialog=None
+        for label,adjust in [('极差',.12),('较差',.07),('一般',.02),('合适',-.02),('完美',-.04)]:
+            ttk.Button(buttons,text=label,width=6,command=lambda l=label,a=adjust: rate(l,a)).pack(side='left',padx=2)
+        def cancel():
+            dialog.destroy(); self.feedback_dialog=None
+        ttk.Button(dialog,text='取消',command=cancel).pack(pady=(0,12))
+        dialog.protocol('WM_DELETE_WINDOW',cancel)
+        dialog.lift()
+    def clear_analysis_data(self):
+        # Keep image and display preferences; reset learned analysis and timing state.
+        self.analysis_bias=1.0; self.config.pop('feedback_counts',None)
+        self.offset.set(0)
+        if self.analyzer:
+            self.analyzer.analysis_bias=1.0; self.analyzer.reset_epoch += 1
+        self.flash_started=-1e9
+        self.status.set('学习记录、BPM 锁定和对轨状态已清除。')
         self.save()
     def set_top(self): self.top_value = self.top.get(); self.win.attributes('-topmost', self.top_value); self.save()
     def wheel(self, e):
@@ -285,7 +380,7 @@ class App:
         if self.drag: self.win.geometry('+%d+%d' % (max(0,e.x_root-self.drag[0]), max(0,e.y_root-self.drag[1])))
     def save(self):
         try:
-            self.config.update(image=self.image_path, size=self.size.get(), top=self.top.get(), fps=int(self.fps.get()), amplitude=self.amplitude.get(), offset=self.offset.get(), feedback_enabled=self.feedback_enabled.get(), analysis_bias=self.analysis_bias, x=self.win.winfo_x(), y=self.win.winfo_y())
+            self.config.update(image=self.image_path, size=self.size.get(), top=self.top.get(), fps=int(self.fps.get()), amplitude=self.amplitude.get(), offset=self.offset.get(), feedback_enabled=self.feedback_enabled.get(), analysis_bias=self.analysis_bias, beat_mode=self.beat_mode.get(), flash_enabled=self.flash_enabled.get(), flash_color=self.flash_color, flash_duration=self.flash_duration.get(), x=self.win.winfo_x(), y=self.win.winfo_y())
             with open(CONFIG, 'w', encoding='utf-8') as f: json.dump(self.config, f, ensure_ascii=False, indent=2)
         except Exception: pass
     def make_tray(self):
@@ -313,6 +408,9 @@ class App:
                     elif self.mode.get() == 'process': self.status.set('未检测到网易云声音，请确认正在播放并重新查找。')
                 elif kind == 'song_end':
                     if self.feedback_enabled.get(): self.song_feedback(value)
+                elif kind == 'bpm_locked':
+                    if self.flash_enabled.get(): self.flash_started=time.monotonic()
+                    self.status.set('BPM 已锁定：'+str(round(value)))
                 elif kind == 'status': self.status.set(value)
                 elif kind == 'error': self.status.set(value); self.bpmtext.set('BPM：--')
         except queue.Empty: pass
@@ -322,7 +420,13 @@ class App:
         now=time.monotonic(); dt=min(.2, max(.001, now-self.last_frame_time)); self.last_frame_time=now
         active = bool(self.analyzer and level > .002 and beat)
         amp=max(0., min(1.5, self.amplitude.get()/100)) if active else 0.
-        event_time=beat + self.offset.get() if beat else -1e9
+        shift=self.offset.get()
+        event_time=beat+shift if beat else -1e9
+        if beat and bpm and shift < 0 and self.beat_mode.get() == 'fixed':
+            interval=(2 if bpm>150 else 1)*60/bpm
+            next_time=beat+interval+shift
+            if next_time <= now < beat+interval+.08 and level > .008:
+                event_time=next_time
         age=now-event_time
         period=60/bpm if bpm and bpm>0 else .65
         cycle=min(.82, max(.48, period*.92))
@@ -341,6 +445,15 @@ class App:
         size = self.size.get(); w0, h0 = self.original.size; ratio = min(size / max(w0,h0), 1e5)
         w, h = max(1,int(w0*ratio*self.anim_sx)), max(1,int(h0*ratio*self.anim_sy))
         canvas = Image.new('RGBA', (int(size*1.55), int(size*1.55)), (255,0,255,0)); frame = self.original.resize((w,h), Image.Resampling.LANCZOS); canvas.alpha_composite(frame, ((canvas.width-w)//2, int(canvas.height*.84)-h))
+        elapsed=now-self.flash_started
+        duration=max(.1,float(self.flash_duration.get()))
+        if self.flash_enabled.get() and 0 <= elapsed < duration:
+            fade=1-elapsed/duration
+            rgb=tuple(int(self.flash_color[i:i+2],16) for i in (1,3,5))
+            original_alpha=canvas.getchannel('A')
+            tinted=Image.blend(canvas.convert('RGB'),Image.new('RGB',canvas.size,rgb),fade)
+            tinted.putalpha(original_alpha)
+            canvas=tinted
         # Tk's Windows color-key transparency cannot display partial alpha reliably.
         # Use a binary alpha key with the original edge RGB values, avoiding purple/magenta fringes.
         alpha=canvas.getchannel('A').point(lambda p: 255 if p >= 12 else 0)
