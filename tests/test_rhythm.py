@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from app import BeatTracker, learned_octave_bias
+from app import BeatTracker, learned_octave_bias, process_capture_supported
 
 RATE = 48_000
 CHUNK = 1024
@@ -94,6 +94,18 @@ def test_manual_lock_keeps_current_song_tempo():
         tracker.feed(signal[i:i+CHUNK],i/RATE)
     assert tracker.bpm==110.
 
+def test_manual_lock_still_corrects_phase():
+    tracker=BeatTracker()
+    tracker.manual_bpm=120.; tracker.bpm=120.; tracker.phase=.45
+    signal=render(duration=10)
+    for i in range(0,len(signal)-CHUNK,CHUNK):
+        tracker.feed(signal[i:i+CHUNK],i/RATE)
+    assert .46 < tracker.phase < .52
+
+def test_windows_capture_capability():
+    assert not process_capture_supported(19045)
+    assert process_capture_supported(22000)
+
 if __name__ == '__main__':
     test_fixed_grid()
     test_distinct_songs_keep_independent_tempo()
@@ -101,4 +113,6 @@ if __name__ == '__main__':
     test_end_silence_threshold_and_reference_bpm()
     test_feedback_needs_repeated_evidence()
     test_manual_lock_keeps_current_song_tempo()
+    test_manual_lock_still_corrects_phase()
+    test_windows_capture_capability()
     print('Rhythm checks passed.')

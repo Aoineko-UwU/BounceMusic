@@ -15,8 +15,8 @@ def near_center(window):
     window.update_idletasks()
     expected_x = (window.winfo_screenwidth() - window.winfo_width()) / 2
     expected_y = (window.winfo_screenheight() - window.winfo_height()) / 2
-    assert abs(window.winfo_x() - expected_x) < 3
-    assert abs(window.winfo_y() - expected_y) < 3
+    assert abs(window.winfo_x() - expected_x) < 3, (window.geometry(),expected_x,expected_y)
+    assert abs(window.winfo_y() - expected_y) < 3, (window.geometry(),expected_x,expected_y)
 
 
 def find_label(widget, text):
@@ -61,9 +61,27 @@ def test_window_and_image_flow():
                 application.close_sprite(first.id)
                 assert first not in application.sprites
                 assert len(json.loads(Path(config).read_text(encoding='utf-8'))['windows']) == 2
+                application.select_sprite(second.id)
                 application.show_settings()
-                near_center(application.settings_window)
                 application.settings_window.update()
+                near_center(application.settings_window)
+                assert application.preview_key[0] == id(second.original)
+                assert application.loading_preview.cget('image')
+                application.loading_x.set(25)
+                application.loading_y.set(70)
+                application.set_loading_position()
+                assert application.preview_key[1:3] == (25,70)
+                second.render(1.,1.,0.,(255,255,255),0)
+                assert second.render_key[-2:] == ((25,70),0)
+                saved=json.loads(Path(config).read_text(encoding='utf-8'))
+                assert (saved['loading_x'],saved['loading_y']) == (85,12)
+                second_record=next(record for record in saved['windows'] if record['id']==second.id)
+                assert (second_record['loading_x'],second_record['loading_y']) == (25,70)
+                application.select_sprite(application.sprites[0].id)
+                assert (application.loading_x.get(),application.loading_y.get()) == (85,12)
+                application.loading_target.current(1)
+                application.on_loading_target_selected()
+                assert (application.loading_x.get(),application.loading_y.get()) == (25,70)
                 for name in ('最高弹跳速度','渐隐时间','歌曲结束静音阈值'):
                     label=find_label(application.settings_window,name)
                     scale=next(child for child in label.master.winfo_children() if isinstance(child,module.tk.Scale))
@@ -124,6 +142,20 @@ def test_window_and_image_flow():
                 application.quit()
 
 
+def test_windows_10_uses_device_mode():
+    with tempfile.TemporaryDirectory() as directory:
+        with patch.object(module,'CONFIG',str(Path(directory)/'设置.json')), \
+             patch.object(module,'process_capture_supported',return_value=False), \
+             patch.object(module.App,'make_tray'), patch.object(module.App,'refresh_sources'):
+            application=module.App()
+            try:
+                assert application.source_mode.get()=='device'
+                assert '播放设备' in application.status.get()
+            finally:
+                application.quit()
+
+
 if __name__ == '__main__':
     test_window_and_image_flow()
+    test_windows_10_uses_device_mode()
     print('UI checks passed.')

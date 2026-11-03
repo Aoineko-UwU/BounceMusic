@@ -49,6 +49,10 @@ def processes():
         except (psutil.NoSuchProcess, psutil.AccessDenied): pass
     return sorted(found, key=lambda p: (p[1].lower(), p[0]))
 
+def process_capture_supported(build=None):
+    build=sys.getwindowsversion().build if build is None else build
+    return build>=20348
+
 def learned_octave_bias(examples):
     votes={-1:0.,0:0.,1:0.}
     for example in examples[-50:]:
@@ -272,11 +276,13 @@ class Analyzer:
             if p: p.terminate()
 
 class SpriteWindow:
-    def __init__(self, app, sprite_id, image_path='', size=240, x=800, y=250):
+    def __init__(self, app, sprite_id, image_path='', size=240, x=800, y=250, loading_x=85, loading_y=12):
         self.app, self.id = app, sprite_id
         self.image_path = image_path
         self.original = app.get_image(image_path)
         self.size = max(100, min(450, int(size)))
+        self.loading_x=max(0,min(100,int(loading_x)))
+        self.loading_y=max(0,min(100,int(loading_y)))
         self.photo = None
         self.render_key = None
         self.drag = None
@@ -347,7 +353,8 @@ class SpriteWindow:
         ratio = self.size / max(w0, h0)
         w = max(1, int(w0*ratio*sx)); h = max(1, int(h0*ratio*sy))
         flash_step = round(flash*32)
-        key = (id(original), side, w, h, flash_step, color if flash_step else None, loading_index)
+        loading_position=self.app.get_loading_position(self) if loading_index>=0 else None
+        key = (id(original), side, w, h, flash_step, color if flash_step else None, loading_position, loading_index)
         if key == self.render_key:
             return
         if key in self.app.frame_cache:
@@ -369,8 +376,9 @@ class SpriteWindow:
                 overlay=frames[loading_index % len(frames)]
                 left=(side-w)//2
                 top=int(side*.84)-h
-                ox=max(0,min(side-overlay.width,left+w-overlay.width//2))
-                oy=max(0,top-overlay.height//3)
+                position_x,position_y=loading_position
+                ox=max(0,min(side-overlay.width,round(left+w*position_x/100-overlay.width/2)))
+                oy=max(0,min(side-overlay.height,round(top+h*position_y/100-overlay.height/2)))
                 canvas.alpha_composite(overlay,(ox,oy))
         alpha = canvas.getchannel('A').point(lambda p: 255 if p >= 12 else 0)
         keyed = Image.composite(canvas.convert('RGB'), Image.new('RGB', canvas.size, (255,0,255)), alpha)
@@ -381,7 +389,8 @@ class SpriteWindow:
 
     def record(self):
         return {'id': self.id, 'image': self.image_path, 'size': self.size,
-                'x': self.win.winfo_x(), 'y': self.win.winfo_y()}
+                'x': self.win.winfo_x(), 'y': self.win.winfo_y(),
+                'loading_x':self.loading_x,'loading_y':self.loading_y}
 
 
 class App:
@@ -423,7 +432,7 @@ class App:
         self.flash_started = -1e9
         self.shared_image_path = self.config.get('image','')
         self.shared_original = self.get_image(self.shared_image_path)
-        self.source_mode = tk.StringVar(value='process')
+        self.source_mode = tk.StringVar(value='process' if process_capture_supported() else 'device')
         self.filter_text = tk.StringVar()
         self.image_mode = tk.StringVar(value=self.config.get('image_mode','uniform'))
         if self.image_mode.get() not in ('uniform','multiple'):
@@ -447,9 +456,16 @@ class App:
         self.flash_duration = tk.DoubleVar(value=float(self.config.get('flash_duration',.55)))
         self.feedback_enabled = tk.BooleanVar(value=self.config.get('feedback_enabled',False))
         self.double_click_close = tk.BooleanVar(value=self.config.get('double_click_close',True))
+        self.shared_loading_x=max(0,min(100,int(self.config.get('loading_x',85))))
+        self.shared_loading_y=max(0,min(100,int(self.config.get('loading_y',12))))
+        self.loading_x = tk.IntVar(value=self.shared_loading_x)
+        self.loading_y = tk.IntVar(value=self.shared_loading_y)
+        self.loading_syncing=False
+        self.preview_key=None
         self.manual_bpm_text = tk.StringVar()
         self.end_silence = tk.DoubleVar(value=max(1.,min(30.,float(self.config.get('end_silence',5.)))))
-        self.status = tk.StringVar(value='请选择音频源，然后点击开始监听')
+        self.status = tk.StringVar(value=('请选择音频源，然后点击开始监听' if process_capture_supported() else
+                                          '此版 Windows 10 请使用播放设备监听；进程音频接口不可用。'))
         self.bpmtext = tk.StringVar(value='BPM：--')
         self.build_main()
         saved = self.config.get('windows')
@@ -457,7 +473,8 @@ class App:
             for record in saved:
                 if record.get('visible',True):
                     self.make_sprite(record.get('image',''), record.get('size',240),
-                                     record.get('x',800), record.get('y',250))
+                                     record.get('x',800), record.get('y',250),
+                                     record.get('loading_x',85), record.get('loading_y',12))
         else:
             self.make_sprite(self.shared_image_path, self.config.get('size',240),
                              self.config.get('x',800), self.config.get('y',250))
@@ -481,6 +498,50 @@ class App:
             if t<duration: return index
             t-=duration
         return len(self.loading_durations)-1
+    def update_loading_preview(self):
+        if not hasattr(self,'loading_preview') or not self.loading_preview.winfo_exists(): return
+        sprite=self.selected_sprite()
+        original=(self.shared_original if self.image_mode.get()=='uniform' else
+                  sprite.original if sprite else self.shared_original)
+        index=self.loading_frame_index(time.monotonic())
+        position_x,position_y=self.get_loading_position(sprite)
+        key=(id(original),position_x,position_y,index)
+        if key==self.preview_key: return
+        canvas=Image.new('RGBA',(170,170),(246,247,249,255))
+        frame=original.copy()
+        frame.thumbnail((140,140),Image.Resampling.LANCZOS)
+        w,h=frame.size; left=(170-w)//2; top=155-h
+        canvas.alpha_composite(frame,(left,top))
+        frames=self.loading_frames_for(155)
+        if frames and index>=0:
+            overlay=frames[index % len(frames)]
+            ox=max(0,min(170-overlay.width,round(left+w*position_x/100-overlay.width/2)))
+            oy=max(0,min(170-overlay.height,round(top+h*position_y/100-overlay.height/2)))
+            canvas.alpha_composite(overlay,(ox,oy))
+        self.preview_photo=ImageTk.PhotoImage(canvas)
+        self.loading_preview.config(image=self.preview_photo)
+        self.preview_key=key
+    def set_loading_position(self,value=None):
+        if self.loading_syncing: return
+        sprite=self.selected_sprite()
+        if self.image_mode.get()=='multiple' and sprite:
+            sprite.loading_x=self.loading_x.get(); sprite.loading_y=self.loading_y.get()
+        else:
+            self.shared_loading_x=self.loading_x.get(); self.shared_loading_y=self.loading_y.get()
+        self.preview_key=None
+        self.update_loading_preview()
+        self.save()
+    def get_loading_position(self,sprite=None):
+        if self.image_mode.get()=='multiple' and sprite:
+            return sprite.loading_x,sprite.loading_y
+        return self.shared_loading_x,self.shared_loading_y
+    def sync_loading_position(self):
+        self.loading_syncing=True
+        self.loading_x.set(self.get_loading_position(self.selected_sprite())[0])
+        self.loading_y.set(self.get_loading_position(self.selected_sprite())[1])
+        self.loading_syncing=False
+        self.preview_key=None
+        self.update_loading_preview()
 
     def build_main(self):
         main = ttk.Frame(self.root,padding=16); main.pack(fill='both',expand=True)
@@ -489,9 +550,13 @@ class App:
         ttk.Button(heading,text='设置',command=self.show_settings).pack(side='right')
         ttk.Label(main,text='选择音频源，然后保持Q弹！').pack(anchor='w',pady=(3,10))
         row=ttk.Frame(main); row.pack(fill='x')
-        ttk.Radiobutton(row,text='指定软件进程',variable=self.source_mode,value='process',command=self.refresh_sources).pack(side='left')
+        process_button=ttk.Radiobutton(row,text='指定软件进程',variable=self.source_mode,value='process',command=self.refresh_sources)
+        process_button.pack(side='left')
+        if not process_capture_supported(): process_button.state(['disabled'])
         ttk.Radiobutton(row,text='播放设备',variable=self.source_mode,value='device',command=self.refresh_sources).pack(side='left',padx=12)
-        ttk.Button(row,text='自动查找网易云',command=self.find_netease).pack(side='right')
+        netease_button=ttk.Button(row,text='自动查找网易云',command=self.find_netease)
+        netease_button.pack(side='right')
+        if not process_capture_supported(): netease_button.state(['disabled'])
         row=ttk.Frame(main); row.pack(fill='x',pady=5)
         ttk.Label(row,text='筛选进程').pack(side='left')
         ttk.Entry(row,textvariable=self.filter_text).pack(side='left',fill='x',expand=True,padx=8)
@@ -545,7 +610,9 @@ class App:
 
     def show_settings(self):
         if self.settings_window and self.settings_window.winfo_exists():
-            self.settings_window.deiconify(); self.settings_window.lift(); return
+            self.settings_window.deiconify(); self.settings_window.lift()
+            self.preview_key=None; self.update_loading_preview()
+            return
         window=tk.Toplevel(self.root); self.settings_window=window
         window.title('Q弹音乐 · 设置'); window.resizable(False,False)
         main=ttk.Frame(window,padding=16); main.pack(fill='both',expand=True)
@@ -578,6 +645,28 @@ class App:
                  command=self.set_end_silence).pack(side='left',padx=8)
         ttk.Label(row,textvariable=self.end_silence,width=4,anchor='e').pack(side='left')
         ttk.Label(row,text='秒').pack(side='left',padx=(3,0))
+        ttk.Label(main,text='加载动图位置（当前所选图片预览）').pack(anchor='w',pady=(8,3))
+        target_row=ttk.Frame(main); target_row.pack(fill='x',pady=(0,4))
+        ttk.Label(target_row,text='调整图片').pack(side='left',padx=(0,8))
+        self.loading_target=ttk.Combobox(target_row,state='readonly',width=28)
+        self.loading_target.pack(side='left')
+        self.loading_target.bind('<<ComboboxSelected>>',self.on_loading_target_selected)
+        self.refresh_loading_targets()
+        position_row=ttk.Frame(main); position_row.pack(fill='x')
+        position_controls=ttk.Frame(position_row); position_controls.pack(side='left',fill='x',expand=True)
+        for title,variable in [('横向',self.loading_x),('纵向',self.loading_y)]:
+            control=ttk.Frame(position_controls); control.pack(fill='x',pady=8)
+            ttk.Label(control,text=title,width=4).pack(side='left')
+            tk.Scale(control,variable=variable,from_=0,to=100,resolution=1,orient='horizontal',
+                     showvalue=False,highlightthickness=0,length=200,
+                     command=self.set_loading_position).pack(side='left',fill='x',expand=True,padx=5)
+            ttk.Label(control,textvariable=variable,width=4,anchor='e').pack(side='left')
+        preview_frame=ttk.Frame(position_row,width=170,height=170,relief='solid',borderwidth=1)
+        preview_frame.pack(side='right',padx=(12,0))
+        preview_frame.pack_propagate(False)
+        self.loading_preview=tk.Label(preview_frame,bg='#f6f7f9',bd=0)
+        self.loading_preview.pack(fill='both',expand=True)
+        self.preview_key=None; self.update_loading_preview()
         ttk.Checkbutton(main,text='双击图片时快速关闭该图片',variable=self.double_click_close,command=self.save).pack(anchor='w',pady=(4,0))
         ttk.Separator(main).pack(fill='x',pady=12)
         ttk.Label(main,text='点击主窗口 X 时').pack(anchor='w')
@@ -589,8 +678,10 @@ class App:
         ttk.Button(main,text='清除学习与对轨数据',command=self.clear_analysis_data).pack(anchor='w')
         ttk.Label(main,text='保留图片、动画和窗口设置；重置节奏反馈、校准记录与当前 BPM。',wraplength=430,foreground='#666666').pack(anchor='w',pady=6)
         window.protocol('WM_DELETE_WINDOW',lambda: (self.save(),window.withdraw()))
-        center_window(window, 500)
+        center_window(window, 520)
+        window.attributes('-topmost',True)
         window.lift()
+        window.after_idle(lambda: center_window(window,520) if window.winfo_exists() else None)
 
     def request_close(self):
         action=self.close_action.get()
@@ -641,8 +732,8 @@ class App:
         if self.tray: self.tray.stop()
         self.root.destroy()
 
-    def make_sprite(self, image='', size=240, x=800, y=250):
-        sprite=SpriteWindow(self,self.next_sprite_id,image,size,x,y)
+    def make_sprite(self, image='', size=240, x=800, y=250, loading_x=85, loading_y=12):
+        sprite=SpriteWindow(self,self.next_sprite_id,image,size,x,y,loading_x,loading_y)
         self.next_sprite_id+=1; self.sprites.append(sprite)
         if self.selected_id is None: self.selected_id=sprite.id; self.size.set(sprite.size)
         return sprite
@@ -656,12 +747,16 @@ class App:
                 self.sprite_list.selection_set(i)
                 self.sprite_list.see(i)
                 self.size.set(sprite.size)
+                self.sync_loading_position()
+                if hasattr(self,'loading_target') and self.loading_target.winfo_exists() and self.image_mode.get()=='multiple':
+                    self.loading_target.current(i)
                 break
     def on_sprite_selected(self, event=None):
         selection=self.sprite_list.curselection()
         if selection:
             sprite=self.sprites[selection[0]]
             self.selected_id=sprite.id; self.size.set(sprite.size)
+            self.sync_loading_position()
     def refresh_sprite_list(self):
         self.sprite_list.delete(0,tk.END)
         for sprite in self.sprites:
@@ -669,6 +764,21 @@ class App:
             name=os.path.basename(path) if path else '默认图'
             self.sprite_list.insert(tk.END,f'图片 {sprite.id} · {name}')
         if self.selected_id is not None: self.select_sprite(self.selected_id)
+        self.refresh_loading_targets()
+    def refresh_loading_targets(self):
+        if not hasattr(self,'loading_target') or not self.loading_target.winfo_exists(): return
+        if self.image_mode.get()=='uniform':
+            self.loading_target['values']=['统一图片']
+            self.loading_target.current(0)
+        else:
+            values=[f'图片 {sprite.id} · {os.path.basename(sprite.image_path) or "默认图"}' for sprite in self.sprites]
+            self.loading_target['values']=values or ['默认图']
+            index=next((i for i,sprite in enumerate(self.sprites) if sprite.id==self.selected_id),0)
+            self.loading_target.current(index)
+    def on_loading_target_selected(self,event=None):
+        index=self.loading_target.current()
+        if self.image_mode.get()=='multiple' and 0<=index<len(self.sprites):
+            self.select_sprite(self.sprites[index].id)
     def add_sprite(self):
         path=''
         if self.image_mode.get()=='multiple':
@@ -687,10 +797,10 @@ class App:
                 sprite=self.selected_sprite()
                 if not sprite: sprite=self.make_sprite()
                 sprite.image_path=path; sprite.original=original
-            self.prune_image_cache(); self.refresh_sprite_list(); self.save()
+            self.prune_image_cache(); self.refresh_sprite_list(); self.update_loading_preview(); self.save()
         except Exception as error: messagebox.showerror('图片导入失败',str(error),parent=self.root)
     def set_image_mode(self):
-        self.refresh_sprite_list(); self.save()
+        self.refresh_sprite_list(); self.sync_loading_position(); self.save()
     def close_selected_sprite(self):
         sprite=self.selected_sprite()
         if sprite: self.close_sprite(sprite.id)
@@ -699,7 +809,7 @@ class App:
         if sprite:
             sprite.win.destroy(); self.sprites.remove(sprite)
             if self.selected_id==sprite_id: self.selected_id=self.sprites[0].id if self.sprites else None
-            self.prune_image_cache(); self.refresh_sprite_list(); self.save()
+            self.prune_image_cache(); self.refresh_sprite_list(); self.sync_loading_position(); self.save()
     def change_selected_size(self,value):
         sprite=self.selected_sprite()
         if sprite: sprite.size=max(100,min(450,int(float(value)))); self.save()
@@ -772,6 +882,8 @@ class App:
             self.flash_color=chosen; self.color_preview.config(bg=chosen); self.save()
 
     def find_netease(self):
+        if not process_capture_supported():
+            self.status.set('此版 Windows 10 请使用播放设备监听。'); return
         self.source_mode.set('process'); self.filter_text.set('cloudmusic'); self.refresh_sources()
         targets=[p for p in self.all_sources if p[1].lower()=='cloudmusic.exe']
         if not targets:
@@ -815,6 +927,10 @@ class App:
         if self.sources: self.combo.current(index)
         else: self.combo.set(''); self.status.set('没有匹配的音频源，请打开音乐软件或清除筛选后刷新。')
     def start(self):
+        if self.source_mode.get()=='process' and not process_capture_supported():
+            self.source_mode.set('device'); self.refresh_sources()
+            messagebox.showinfo('Windows 10 音频监听','当前系统不支持单软件进程音频捕获，请选择播放设备后再开始监听。',parent=self.root)
+            return
         i=self.combo.current()
         if i<0: messagebox.showwarning('音频源','请先选择音频源。',parent=self.root); return
         self.stop(); source=self.sources[i]; mode=self.source_mode.get()
@@ -872,6 +988,7 @@ class App:
         try:
             self.config.update(image=self.shared_image_path, image_mode=self.image_mode.get(),
                 windows=[sprite.record() for sprite in self.sprites], top=self.top.get(),
+                loading_x=self.shared_loading_x, loading_y=self.shared_loading_y,
                 main_geometry=f'{max(610,self.root.winfo_width())}x{max(610,self.root.winfo_height())}',
                 size=self.size.get(), fps=int(self.fps.get()), amplitude=self.amplitude.get(),
                 offset=self.offset.get(), feedback_enabled=self.feedback_enabled.get(),
@@ -953,6 +1070,8 @@ class App:
         self.frame_cache={}
         for sprite in self.sprites:
             sprite.render(self.anim_sx,self.anim_sy,flash,color,loading_index)
+        if self.settings_window and self.settings_window.winfo_exists() and self.settings_window.winfo_viewable():
+            self.update_loading_preview()
         self.tick_job=self.root.after(max(1,round(1000/int(self.fps.get()))),self.tick)
 
 if __name__ == '__main__':
