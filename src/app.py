@@ -1,4 +1,4 @@
-import os, sys, time, threading, queue, json, math, traceback
+import os, sys, time, threading, queue, json, math, traceback, shutil, filecmp
 import ctypes, webbrowser
 import re
 from collections import deque, OrderedDict
@@ -23,7 +23,7 @@ ASSET_BASE = getattr(sys, '_MEIPASS', os.path.dirname(os.path.dirname(os.path.ab
 LOADING_GIF = os.path.join(ASSET_BASE, 'assets', 'Loading.gif')
 APP_ICON = os.path.join(ASSET_BASE, 'assets', 'icon.ico')
 MATOU_IMAGE = os.path.join(ASSET_BASE, 'assets', 'matou.png')
-VERSION = '1.6.1'
+VERSION = '1.6.2'
 AUTHOR = '葵猫猫'
 
 def acquire_single_instance():
@@ -45,6 +45,28 @@ def center_window(window, width=None, height=None):
     x = max(0, (window.winfo_screenwidth()-width)//2)
     y = max(0, (window.winfo_screenheight()-height)//2)
     window.geometry(f'{width}x{height}+{x}+{y}')
+
+def library_dir():
+    return os.path.join(os.path.dirname(CONFIG), '图片')
+
+def image_file(path):
+    if path == 'preset:matou': return MATOU_IMAGE
+    if path.startswith('stored:'):
+        name=path[len('stored:'):]
+        return os.path.join(library_dir(),name) if name and os.path.basename(name)==name else ''
+    return path
+
+def store_image(path):
+    with Image.open(path) as image: image.verify()
+    os.makedirs(library_dir(),exist_ok=True)
+    name=os.path.basename(path); stem,extension=os.path.splitext(name)
+    candidate=os.path.join(library_dir(),name); index=2
+    while os.path.exists(candidate):
+        if os.path.samefile(path,candidate) or filecmp.cmp(path,candidate,shallow=False):
+            return 'stored:'+os.path.basename(candidate)
+        candidate=os.path.join(library_dir(),f'{stem} ({index}){extension}'); index+=1
+    shutil.copy2(path,candidate)
+    return 'stored:'+os.path.basename(candidate)
 
 def render_release_notes(widget, body):
     """Render the common release-note Markdown without executing embedded content."""
@@ -481,12 +503,12 @@ class SpriteWindow:
         self.render_key = None
         self.notice_window = None
         self.drag = None
-        self.win = tk.Toplevel(app.root)
+        self.win = tk.Toplevel(app.root); self.win.withdraw()
         self.win.overrideredirect(True)
         self.win.configure(bg=KEY)
         self.win.wm_attributes('-transparentcolor', KEY)
         self.win.attributes('-topmost', app.top.get())
-        self.label = tk.Label(self.win, bg=KEY, bd=0)
+        self.label = tk.Label(self.win, bg=KEY, bd=0, highlightthickness=0)
         self.label.pack()
         self.label.bind('<ButtonPress-1>', self.press)
         self.label.bind('<B1-Motion>', self.move)
@@ -494,6 +516,7 @@ class SpriteWindow:
         self.label.bind('<Button-3>', self.context_menu)
         self.label.bind('<MouseWheel>', self.wheel)
         self.win.geometry('+%d+%d' % (max(0,int(x)), max(0,int(y))))
+        self.win.deiconify()
 
     @staticmethod
     def load_image(path):
@@ -533,7 +556,7 @@ class SpriteWindow:
             menu.configure(bg='#30343d',fg='#f2f3f5',activebackground='#505866',activeforeground='#ffffff')
         menu.add_command(label='打开主菜单', command=self.app.show_main)
         menu.add_command(label='打开设置', command=self.app.show_settings)
-        menu.add_command(label='新增Q弹', command=self.app.add_sprite)
+        menu.add_command(label='新增Q弹', command=lambda: self.app.add_sprite(self))
         menu.add_command(label='刷新 BPM', command=self.app.refresh_bpm)
         menu.add_command(label='立即对齐节奏', command=self.app.realign_rhythm)
         menu.add_command(label='统一取消置顶' if self.app.top.get() else '统一置顶', command=self.app.toggle_top)
@@ -593,7 +616,7 @@ class SpriteWindow:
                 self.notice_window.destroy(); self.notice_window=None
             return
         if self.notice_window is None:
-            window=tk.Toplevel(self.app.root); self.notice_window=window
+            window=tk.Toplevel(self.app.root); window.withdraw(); self.notice_window=window
             window.overrideredirect(True); window.configure(bg=KEY)
             label=tk.Label(window,bg=KEY,bd=0,highlightthickness=0)
             label.pack(); self.notice_label=label
@@ -634,6 +657,7 @@ class SpriteWindow:
         x=self.win.winfo_x()+(self.win.winfo_width()-self.notice_window.winfo_reqwidth())//2
         y=self.win.winfo_y()+round(self.size*.48-age/duration*self.size*.75)
         self.notice_window.geometry(f'+{max(0,x)}+{max(0,y)}')
+        if self.notice_window.state()=='withdrawn': self.notice_window.deiconify()
 
     def record(self):
         return {'id': self.id, 'image': self.image_path, 'size': self.size,
@@ -643,7 +667,12 @@ class SpriteWindow:
 
 class App:
     def __init__(self):
-        self.root = tk.Tk()
+        if getattr(sys,'frozen',False):
+            try:
+                help_path=os.path.join(BASE,'使用说明.txt')
+                if not os.path.exists(help_path): shutil.copy2(os.path.join(ASSET_BASE,'assets','使用说明.txt'),help_path)
+            except OSError: pass
+        self.root = tk.Tk(); self.root.withdraw()
         self.root.title('Q弹音乐')
         set_window_icon(self.root)
         try: self.root.iconbitmap(default=APP_ICON)
@@ -653,6 +682,14 @@ class App:
                 self.config = json.load(file)
         except Exception:
             self.config = {}
+        def migrate(path):
+            if not isinstance(path,str) or not path or path.startswith(('preset:','stored:')) or not os.path.isfile(path): return path
+            try: return store_image(path)
+            except (OSError,ValueError): return path
+        self.config['image']=migrate(self.config.get('image',''))
+        if isinstance(self.config.get('windows'),list):
+            for record in self.config['windows']:
+                if isinstance(record,dict): record['image']=migrate(record.get('image',''))
         geometry = self.config.get('main_geometry', '680x650')
         self.root.geometry(geometry if isinstance(geometry,str) and re.fullmatch(r'\d{3,4}x\d{3,4}',geometry) else '680x650')
         self.root.minsize(610,610)
@@ -671,7 +708,11 @@ class App:
             recent=[self.config.get('image','')]
             windows=self.config.get('windows',[])
             if isinstance(windows,list): recent.extend(record.get('image','') for record in windows if isinstance(record,dict))
-        self.recent_images=[p for p in recent if isinstance(p,str) and os.path.isfile(p)][:30] if isinstance(recent,list) else []
+        self.recent_images=[migrate(p) for p in recent if isinstance(p,str) and os.path.isfile(image_file(p))] if isinstance(recent,list) else []
+        if os.path.isdir(library_dir()):
+            for name in sorted(os.listdir(library_dir()),key=str.casefold):
+                if os.path.splitext(name)[1].lower() in ('.png','.jpg','.jpeg','.webp','.bmp','.gif') and os.path.isfile(os.path.join(library_dir(),name)):
+                    self.recent_images.append('stored:'+name)
         self.recent_images=list(dict.fromkeys(self.recent_images))
         self.frame_cache = {}
         self.resize_cache = OrderedDict()
@@ -757,11 +798,14 @@ class App:
                                      record.get('loading_x',85), record.get('loading_y',12))
         else:
             self.make_sprite(self.shared_image_path, self.config.get('size',240),
-                             self.config.get('x',800), self.config.get('y',250))
+                             self.config.get('x',max(0,(self.root.winfo_screenwidth()-372)//2)),
+                             self.config.get('y',max(0,(self.root.winfo_screenheight()-372)//2)))
         self.refresh_sprite_list()
         self.root.protocol('WM_DELETE_WINDOW',self.request_close)
         self.refresh_sources()
         self.make_tray()
+        width,height=map(int,(geometry if isinstance(geometry,str) and re.fullmatch(r'\d{3,4}x\d{3,4}',geometry) else '680x650').split('x'))
+        center_window(self.root,max(610,width),max(610,height)); self.root.deiconify()
         self.tick()
 
     def apply_theme(self):
@@ -904,9 +948,9 @@ class App:
         ttk.Radiobutton(row,text='使用统一图片',variable=self.image_mode,value='uniform',command=self.set_image_mode).pack(side='left',padx=8)
         ttk.Radiobutton(row,text='使用多种图片',variable=self.image_mode,value='multiple',command=self.set_image_mode).pack(side='left')
         row=ttk.Frame(main); row.pack(fill='x',pady=4)
+        ttk.Button(row,text='导入图片',command=self.import_image).pack(side='left',padx=(0,7))
         self.image_picker_button=ttk.Button(row,text='选择图片',command=self.show_image_picker)
         self.image_picker_button.pack(side='left',padx=(0,7))
-        ttk.Button(row,text='导入图片',command=self.import_image).pack(side='left')
         ttk.Button(row,text='新增Q弹',command=self.add_sprite).pack(side='left',padx=7)
         ttk.Button(row,text='关闭所选图片',command=self.close_selected_sprite).pack(side='left')
         ttk.Checkbutton(row,text='全部置顶',variable=self.top,command=self.set_top).pack(side='right')
@@ -946,7 +990,7 @@ class App:
         if self.settings_window and self.settings_window.winfo_exists():
             self.settings_window.deiconify(); self.settings_window.lift()
             self.preview_key=None; self.update_loading_preview(); return
-        window=tk.Toplevel(self.root); self.settings_window=window
+        window=tk.Toplevel(self.root); window.withdraw(); self.settings_window=window
         set_window_icon(window)
         window.title('Q弹音乐 · 设置'); window.resizable(False,False)
         notebook=ttk.Notebook(window); notebook.pack(fill='both',expand=True,padx=12,pady=12)
@@ -1037,15 +1081,14 @@ class App:
         ttk.Label(about,textvariable=self.update_status,wraplength=440).pack(anchor='w')
         window.protocol('WM_DELETE_WINDOW',lambda: (self.save(),window.withdraw()))
         self.apply_theme()
-        center_window(window,540); window.attributes('-topmost',True); window.lift()
-        window.after_idle(lambda: center_window(window,540) if window.winfo_exists() else None)
+        center_window(window,540); window.deiconify(); window.attributes('-topmost',True); window.lift()
 
     def request_close(self):
         action=self.close_action.get()
         if action=='hide': self.hide_main()
         elif action=='quit': self.quit()
         else:
-            dialog=tk.Toplevel(self.root); set_window_icon(dialog); dialog.title('关闭 Q弹音乐'); dialog.resizable(False,False); dialog.transient(self.root)
+            dialog=tk.Toplevel(self.root); dialog.withdraw(); set_window_icon(dialog); dialog.title('关闭 Q弹音乐'); dialog.resizable(False,False); dialog.transient(self.root)
             ttk.Label(dialog,text='关闭主窗口后要执行什么操作？',padding=14).pack()
             never=tk.BooleanVar(value=False)
             ttk.Checkbutton(dialog,text='不再询问，记住本次选择',variable=never).pack(anchor='w',padx=14)
@@ -1061,7 +1104,7 @@ class App:
             dialog.protocol('WM_DELETE_WINDOW',dialog.destroy)
             self.apply_theme()
             center_window(dialog)
-            dialog.lift(); dialog.grab_set()
+            dialog.deiconify(); dialog.lift(); dialog.grab_set()
 
     def show_main(self):
         self.root.deiconify(); self.root.lift(); self.root.focus_force()
@@ -1070,10 +1113,10 @@ class App:
             if not hasattr(self,'default_image'): self.default_image=slime()
             return self.default_image
         if path not in self.image_cache:
-            self.image_cache[path]=SpriteWindow.load_image(MATOU_IMAGE if path=='preset:matou' else path)
+            self.image_cache[path]=SpriteWindow.load_image(image_file(path))
         return self.image_cache[path]
     def image_name(self,path):
-        return '默认图片' if not path else ('玛头' if path=='preset:matou' else os.path.basename(path))
+        return '默认图片' if not path else ('玛头' if path=='preset:matou' else os.path.basename(image_file(path)))
     def render_source(self, original, size):
         limit=max(128,int(size*1.4)); key=(id(original),limit)
         if key not in self.resize_cache:
@@ -1148,27 +1191,38 @@ class App:
         index=self.loading_target.current()
         if self.image_mode.get()=='multiple' and 0<=index<len(self.sprites):
             self.select_sprite(self.sprites[index].id)
-    def add_sprite(self):
-        path=''
-        if self.image_mode.get()=='multiple':
-            path=filedialog.askopenfilename(parent=self.root,title='为新窗口选择图片（取消则使用默认图）',filetypes=[('图片','*.png *.jpg *.jpeg *.webp *.bmp *.gif'),('所有文件','*.*')])
-        x=800+35*len(self.sprites); y=250+35*len(self.sprites)
+    def add_sprite(self, source=None):
+        if not self.sprites:
+            path=''
+            if self.image_mode.get()=='uniform': self.shared_image_path=''; self.shared_original=self.get_image('')
+        elif self.image_mode.get()=='uniform': path=self.shared_image_path
+        else: path=(source if source in self.sprites else self.sprites[-1]).image_path
+        side=int(self.size.get()*1.55)
+        if source in self.sprites:
+            x=self.root.winfo_pointerx()-side//2; y=self.root.winfo_pointery()-side//2
+        else:
+            x=(self.root.winfo_screenwidth()-side)//2+35*len(self.sprites)
+            y=(self.root.winfo_screenheight()-side)//2+35*len(self.sprites)
+        x=max(0,min(x,self.root.winfo_screenwidth()-side)); y=max(0,min(y,self.root.winfo_screenheight()-side))
         sprite=self.make_sprite(path,self.size.get(),x,y)
-        if path: self.remember_image(path)
         self.refresh_sprite_list(); self.select_sprite(sprite.id); self.save()
     def import_image(self):
         path=filedialog.askopenfilename(parent=self.root,title='导入图片',filetypes=[('图片','*.png *.jpg *.jpeg *.webp *.bmp *.gif'),('所有文件','*.*')])
         if not path: return
-        self.choose_image(path,remember=True)
+        try:
+            stored=store_image(path); self.remember_image(stored); self.save()
+            self.status.set('图片已导入，点击“选择图片”即可使用。')
+            if self.image_picker and self.image_picker.winfo_exists(): self.image_picker.destroy(); self.image_picker=None
+        except Exception as error: messagebox.showerror('图片导入失败',str(error),parent=self.root)
     def remember_image(self,path):
         self.recent_images=[p for p in self.recent_images if os.path.normcase(p)!=os.path.normcase(path)]
-        self.recent_images.insert(0,path); del self.recent_images[30:]
+        self.recent_images.insert(0,path)
     def picker_thumbnail(self,path):
         if path not in self.picker_thumbnails:
             try:
                 if not path: image=slime()
                 else:
-                    with Image.open(MATOU_IMAGE if path=='preset:matou' else path) as opened:
+                    with Image.open(image_file(path)) as opened:
                         opened.seek(0); opened.draft('RGB',(72,72)); image=ImageOps.exif_transpose(opened).convert('RGBA')
                 image.thumbnail((58,58),Image.Resampling.LANCZOS)
                 self.picker_thumbnails[path]=ImageTk.PhotoImage(image)
@@ -1177,13 +1231,24 @@ class App:
     def show_image_picker(self):
         if self.image_picker and self.image_picker.winfo_exists():
             self.image_picker.destroy(); self.image_picker=None; return
-        picker=tk.Toplevel(self.root); self.image_picker=picker
+        self.root.update_idletasks()
+        picker=tk.Toplevel(self.root); picker.withdraw(); self.image_picker=picker
         picker.overrideredirect(True); picker.attributes('-topmost',True)
         shell=ttk.Frame(picker,padding=8,relief='solid',borderwidth=1); shell.pack(fill='both',expand=True)
         header=ttk.Frame(shell); header.pack(fill='x')
         ttk.Label(header,text='选择图片',font=('Microsoft YaHei UI',10,'bold')).pack(side='left')
         ttk.Button(header,text='×',width=3,command=picker.destroy).pack(side='right')
         body=ttk.Frame(shell); body.pack(fill='both',expand=True)
+        def position_picker():
+            picker.update_idletasks()
+            width,height=picker.winfo_reqwidth(),picker.winfo_reqheight()
+            x=self.image_picker_button.winfo_rootx()+self.image_picker_button.winfo_width()+8
+            y=self.image_picker_button.winfo_rooty()
+            x=max(0,min(x,picker.winfo_screenwidth()-width))
+            y=max(0,min(y,picker.winfo_screenheight()-height))
+            picker.geometry(f'{width}x{height}+{x}+{y}')
+        def expand_picker():
+            picker.withdraw(); populate(True); position_picker(); picker.deiconify(); picker.lift()
         def tile(parent,path,column,row):
             button=ttk.Button(parent,text=self.image_name(path),image=self.picker_thumbnail(path),compound='top',
                               width=11,command=lambda p=path:self.choose_image(p))
@@ -1194,7 +1259,7 @@ class App:
             ttk.Label(body,text='预设图片').pack(anchor='w',pady=(4,0))
             presets=ttk.Frame(body); presets.pack(anchor='w')
             tile(presets,'',0,0); tile(presets,'preset:matou',1,0)
-            ttk.Label(body,text='最近图片').pack(anchor='w',pady=(7,0))
+            ttk.Label(body,text='我的图片').pack(anchor='w',pady=(7,0))
             if not self.recent_images:
                 ttk.Label(body,text='导入图片后会显示在这里。',foreground='#777777').pack(anchor='w',pady=6); return
             if expanded:
@@ -1212,17 +1277,12 @@ class App:
                 grid=ttk.Frame(body); grid.pack(anchor='w')
                 for i,path in enumerate(self.recent_images[:5]): tile(grid,path,i%3,i//3)
                 if len(self.recent_images)>5:
-                    ttk.Button(grid,text='…',width=11,command=lambda:populate(True)).grid(row=1,column=2,padx=3,pady=3,sticky='nsew')
+                    ttk.Button(grid,text='…',width=11,command=expand_picker).grid(row=1,column=2,padx=3,pady=3,sticky='nsew')
         populate()
         picker.bind('<Escape>',lambda event:picker.destroy()); self.apply_theme()
-        picker.update_idletasks()
-        x=self.image_picker_button.winfo_rootx()+self.image_picker_button.winfo_width()+8
-        y=self.image_picker_button.winfo_rooty()
-        x=max(0,min(x,picker.winfo_screenwidth()-picker.winfo_reqwidth()))
-        y=max(0,min(y,picker.winfo_screenheight()-picker.winfo_reqheight()))
-        picker.geometry(f'+{x}+{y}'); picker.lift()
+        position_picker(); picker.deiconify(); picker.lift()
     def choose_image(self,path,remember=False):
-        if path and not path.startswith('preset:') and not os.path.isfile(path):
+        if path and not path.startswith('preset:') and not os.path.isfile(image_file(path)):
             self.status.set('图片文件不存在，请重新导入。'); return
         try:
             if remember:
@@ -1366,7 +1426,6 @@ class App:
         self.update_progress_bar.pack(fill='x',padx=18,pady=(12,16)); self.update_progress_bar.start(12)
         window.protocol('WM_DELETE_WINDOW',window.withdraw)
         self.apply_theme(); center_window(window,460,150); window.deiconify(); window.attributes('-topmost',True); window.lift()
-        window.after_idle(lambda: center_window(window,460,150) if window.winfo_exists() else None)
     def update_download_progress(self, phase, size, total):
         window=self.update_progress_window
         if not window or not window.winfo_exists(): return
@@ -1410,7 +1469,6 @@ class App:
         ttk.Button(row,text='暂不更新',command=dialog.destroy).pack(side='right')
         self.apply_theme()
         center_window(dialog,600,520); dialog.deiconify(); dialog.attributes('-topmost',True); dialog.lift()
-        dialog.after_idle(lambda: center_window(dialog,600,520) if dialog.winfo_exists() else None)
 
     def find_playing_process(self):
         if not process_capture_supported():
@@ -1498,7 +1556,7 @@ class App:
 
     def song_feedback(self,bpm):
         if self.feedback_dialog and self.feedback_dialog.winfo_exists(): return
-        dialog=tk.Toplevel(self.root); self.feedback_dialog=dialog
+        dialog=tk.Toplevel(self.root); dialog.withdraw(); self.feedback_dialog=dialog
         set_window_icon(dialog)
         dialog.title('节奏与 BPM 校准反馈'); dialog.resizable(False,False); dialog.transient(self.root)
         ttk.Label(dialog,text=f'刚才的动画是否与音乐节奏匹配？（估算 BPM：{round(bpm) if bpm else "--"}）',padding=14).pack()
@@ -1532,7 +1590,7 @@ class App:
         dialog.protocol('WM_DELETE_WINDOW',cancel)
         self.apply_theme()
         center_window(dialog)
-        dialog.lift()
+        dialog.deiconify(); dialog.lift()
 
     def save(self):
         try:

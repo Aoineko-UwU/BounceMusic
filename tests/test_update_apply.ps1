@@ -6,6 +6,11 @@ New-Item -ItemType Directory -Path $install,(Join-Path $install '_internal'),(Jo
 Set-Content -LiteralPath (Join-Path $install 'BounceMusic.exe') -Value 'old program'
 Set-Content -LiteralPath (Join-Path $install '_internal\old.txt') -Value 'old internal'
 Set-Content -LiteralPath (Join-Path $install '设置.json') -Value 'user settings'
+$helpName = [string]::Concat([char]0x4f7f, [char]0x7528, [char]0x8bf4, [char]0x660e, '.txt')
+$imagesName = [string]::Concat([char]0x56fe, [char]0x7247)
+New-Item -ItemType Directory -Path (Join-Path $install $imagesName) -Force | Out-Null
+Set-Content -LiteralPath (Join-Path (Join-Path $install $imagesName) 'custom.png') -Value 'personal image'
+Set-Content -LiteralPath (Join-Path $stage "files\$helpName") -Value 'new guide'
 Set-Content -LiteralPath (Join-Path $stage 'files\BounceMusic.exe') -Value 'new program'
 Set-Content -LiteralPath (Join-Path $stage 'files\_internal\new.txt') -Value 'new internal'
 function Start-Process { param($FilePath,$WorkingDirectory,$WindowStyle) }
@@ -15,6 +20,8 @@ try {
     if (-not (Test-Path -LiteralPath (Join-Path $install '_internal\new.txt'))) { throw 'New internal files missing' }
     if (Test-Path -LiteralPath (Join-Path $install '_internal\old.txt')) { throw 'Old internal files remain' }
     if ((Get-Content -Raw -LiteralPath (Join-Path $install '设置.json')).Trim() -ne 'user settings') { throw 'Settings changed' }
+    if ((Get-Content -Raw -LiteralPath (Join-Path $install $helpName)).Trim() -ne 'new guide') { throw 'Guide missing' }
+    if ((Get-Content -Raw -LiteralPath (Join-Path (Join-Path $install $imagesName) 'custom.png')).Trim() -ne 'personal image') { throw 'Image library changed' }
     New-Item -ItemType Directory -Path (Join-Path $stage 'files\_internal') -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $stage 'files\BounceMusic.exe') -Value 'broken update'
     Set-Content -LiteralPath (Join-Path $stage 'files\_internal\newer.txt') -Value 'broken internal'

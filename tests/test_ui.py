@@ -62,6 +62,7 @@ def test_window_and_image_flow():
                 application.image_mode.set('multiple')
                 first = application.make_sprite(image_path, 240, 100, 100)
                 second = application.make_sprite(image_path, 240, 400, 100)
+                assert int(first.label.cget('highlightthickness')) == 0
                 assert max(first.original.size) <= module.MAX_IMAGE_SIDE
                 assert first.original is second.original
                 assert len(application.loading_source_frames) == 12
@@ -272,6 +273,64 @@ def test_image_picker_presets_and_recent():
                 def contains_canvas(widget):
                     return isinstance(widget,module.tk.Canvas) or any(contains_canvas(child) for child in widget.winfo_children())
                 assert contains_canvas(application.image_picker)
+                assert application.image_picker.winfo_x()>0 and application.image_picker.winfo_y()>0
+            finally: application.quit()
+
+def test_image_library_and_new_windows():
+    with tempfile.TemporaryDirectory() as directory:
+        root=Path(directory); config=str(root/'设置.json'); source=root/'original.png'
+        Image.new('RGBA',(24,24),'red').save(source)
+        with patch.object(module,'CONFIG',config),patch.object(module.App,'make_tray'),patch.object(module.App,'refresh_sources'):
+            application=module.App()
+            try:
+                near_center(application.root)
+                application.image_mode.set('multiple')
+                original=application.selected_sprite().image_path
+                with patch.object(module.filedialog,'askopenfilename',return_value=str(source)):
+                    application.import_image()
+                stored='stored:original.png'
+                assert application.selected_sprite().image_path==original
+                assert (root/'图片'/'original.png').is_file()
+                source.unlink()
+                application.choose_image(stored)
+                assert application.selected_sprite().image_path==stored
+                application.add_sprite()
+                assert application.sprites[-1].image_path==stored
+                application.choose_image('preset:matou')
+                application.add_sprite()
+                assert application.sprites[-1].image_path=='preset:matou'
+                application.add_sprite(application.sprites[0])
+                assert application.sprites[-1].image_path==stored
+                application.add_sprite()
+                assert application.sprites[-1].image_path==stored
+                for sprite in application.sprites[:]: application.close_sprite(sprite.id)
+                application.add_sprite()
+                assert application.sprites[-1].image_path==''
+                application.show_image_picker(); application.root.update()
+                picker=application.image_picker
+                assert picker.winfo_x()>0 and picker.winfo_y()>0
+                assert picker.winfo_x() >= application.image_picker_button.winfo_rootx()
+            finally: application.quit()
+            application=module.App()
+            try: assert stored in application.recent_images
+            finally: application.quit()
+
+def test_old_image_migration():
+    with tempfile.TemporaryDirectory() as directory:
+        root=Path(directory); config=root/'设置.json'; old=root/'old.png'
+        Image.new('RGBA',(20,20),'blue').save(old)
+        config.write_text(json.dumps({'image':str(old),'recent_images':[str(old)]}),encoding='utf-8')
+        with patch.object(module,'CONFIG',str(config)),patch.object(module.App,'make_tray'),patch.object(module.App,'refresh_sources'):
+            application=module.App()
+            try:
+                assert application.shared_image_path=='stored:old.png'
+                assert 'stored:old.png' in application.recent_images
+                assert old.exists() and (root/'图片'/'old.png').exists()
+                application.save()
+            finally: application.quit()
+            old.unlink()
+            application=module.App()
+            try: assert application.shared_image_path=='stored:old.png' and 'stored:old.png' in application.recent_images
             finally: application.quit()
 
 
@@ -280,4 +339,6 @@ if __name__ == '__main__':
     test_windows_10_uses_device_mode()
     test_single_instance_mutex()
     test_image_picker_presets_and_recent()
+    test_image_library_and_new_windows()
+    test_old_image_migration()
     print('UI checks passed.')

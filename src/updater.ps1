@@ -1,7 +1,8 @@
 param([string]$Stage, [string]$Install, [int]$AppPid, [switch]$SetupMode)
 $ErrorActionPreference = 'Stop'
 $backup = Join-Path $Install ('.bounce-update-backup-' + $PID)
-$files = @('BounceMusic.exe', '_internal', 'ProcTap-LICENSE.txt')
+$helpFile = [string]::Concat([char]0x4f7f, [char]0x7528, [char]0x8bf4, [char]0x660e, '.txt')
+$files = @('BounceMusic.exe', '_internal', 'ProcTap-LICENSE.txt', $helpFile)
 $old = @()
 $installed = @()
 try {

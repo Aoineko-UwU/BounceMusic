@@ -1,4 +1,4 @@
-param([switch]$SkipInstaller, [string]$InnoCompiler = '', [string]$PythonExe = '')
+﻿param([switch]$SkipInstaller, [string]$InnoCompiler = '', [string]$PythonExe = '')
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 if (-not $PythonExe -and -not (Test-Path '.venv\Scripts\python.exe')) {
@@ -11,9 +11,10 @@ if (-not $PythonExe) { $PythonExe = Join-Path $PSScriptRoot '.venv\Scripts\pytho
 if (-not (Test-Path -LiteralPath $PythonExe)) { throw 'Python executable not found.' }
 & $PythonExe -m pip install -r requirements-build.txt
 if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
-& $PythonExe -m PyInstaller --noconfirm --clean --windowed --onedir --name BounceMusic --icon (Join-Path $PSScriptRoot 'assets\icon.ico') --add-data ((Join-Path $PSScriptRoot 'assets\Loading.gif') + ';assets') --add-data ((Join-Path $PSScriptRoot 'assets\icon.ico') + ';assets') --add-data ((Join-Path $PSScriptRoot 'assets\matou.png') + ';assets') --add-data ((Join-Path $PSScriptRoot 'src\updater.ps1') + ';.') --collect-submodules proctap --collect-submodules winrt.windows.media.control src\app.py
+& $PythonExe -m PyInstaller --noconfirm --clean --windowed --onedir --name BounceMusic --icon (Join-Path $PSScriptRoot 'assets\icon.ico') --add-data ((Join-Path $PSScriptRoot 'assets\Loading.gif') + ';assets') --add-data ((Join-Path $PSScriptRoot 'assets\icon.ico') + ';assets') --add-data ((Join-Path $PSScriptRoot 'assets\matou.png') + ';assets') --add-data ((Join-Path $PSScriptRoot '使用说明.txt') + ';assets') --add-data ((Join-Path $PSScriptRoot 'src\updater.ps1') + ';.') --collect-submodules proctap --collect-submodules winrt.windows.media.control src\app.py
 if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
 Copy-Item -LiteralPath 'third_party\ProcTap-LICENSE.txt' -Destination 'dist\BounceMusic\ProcTap-LICENSE.txt' -Force
+Copy-Item -LiteralPath '使用说明.txt' -Destination 'dist\BounceMusic\使用说明.txt' -Force
 Write-Host 'Built dist\BounceMusic\BounceMusic.exe; retain the accompanying _internal directory.'
 if (-not $SkipInstaller) {
     if (-not $InnoCompiler) {
