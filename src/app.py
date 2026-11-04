@@ -13,6 +13,7 @@ import comtypes
 from proctap import ProcessAudioCapture
 from PIL import Image, ImageDraw, ImageTk, ImageOps, ImageSequence, ImageFont
 import updater
+from media_status import MediaMonitor
 
 BASE = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(BASE, '设置.json')
@@ -21,7 +22,8 @@ MAX_IMAGE_SIDE = 900
 ASSET_BASE = getattr(sys, '_MEIPASS', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LOADING_GIF = os.path.join(ASSET_BASE, 'assets', 'Loading.gif')
 APP_ICON = os.path.join(ASSET_BASE, 'assets', 'icon.ico')
-VERSION = '1.5.0'
+MATOU_IMAGE = os.path.join(ASSET_BASE, 'assets', 'matou.png')
+VERSION = '1.6.0'
 AUTHOR = '葵猫猫'
 
 def acquire_single_instance():
@@ -101,20 +103,37 @@ def learned_octave_bias(examples):
             return direction
     return 0
 
+def local_half_tempo_preference(examples, tempo):
+    """Use nearby, explicitly supplied examples only to resolve an ambiguous octave."""
+    half=0.; same=0.
+    for sample in examples[-50:]:
+        try:
+            estimated=float(sample['estimated']); actual=float(sample['actual'])
+            if not (40<=estimated<=300 and 40<=actual<=300): continue
+            weight=math.exp(-.5*((estimated-tempo)/14.)**2)
+            ratio=actual/estimated
+            if .43<=ratio<=.58: half+=weight
+            elif .87<=ratio<=1.13: same+=weight
+        except (KeyError,TypeError,ValueError,ZeroDivisionError): continue
+    return half>=2.5 and (half+.4)/(half+same+.8)>=.52
+
 class BeatTracker:
-    def __init__(self, rate=48000, chunk=1024, analysis_bias=1.0, fast_bpm_threshold=190, end_silence=3.5, octave_bias=0, bpm_correction='auto', phase_correction='auto'):
+    def __init__(self, rate=48000, chunk=1024, analysis_bias=1.0, fast_bpm_threshold=190, end_silence=3.5, octave_bias=0, bpm_correction='auto', phase_correction='auto', examples=None):
         self.rate, self.chunk, self.analysis_bias = rate, chunk, analysis_bias
         self.fast_bpm_threshold=fast_bpm_threshold
         self.end_silence=end_silence
         self.octave_bias=octave_bias
+        self.examples=list(examples or [])
         self.bpm_correction=bpm_correction; self.phase_correction=phase_correction
         self.last_tempo_check=0.; self.last_phase_adjust=0.
         self.flux = deque(maxlen=int(20*rate/chunk)); self.history = deque(maxlen=48)
+        self.high_flux = deque(maxlen=int(20*rate/chunk))
         self.prev = None; self.bpm = 0.; self.level = 0.; self.beat = 0.; self.phase = 0.
         self.last_onset = 0.; self.steps = 0; self.prev_flux = 0.; self.prev_prev_flux = 0.; self.prev_threshold = float('inf')
         self.tempo_candidates = deque(maxlen=6); self.onsets = deque(maxlen=96)
         self.last_signal = 0.; self.last_visual = -1e9; self.last_grid = None
         self.just_locked = False; self.manual_bpm = 0.
+        self.octave_uncertain=False
         self.shape_target = .12; self.shape = .12; self.beat_strength = .8; self.last_time = 0.; self.song_end = False
         self.ended_bpm = 0.
     def correction_interval(self, setting, phase=False):
@@ -137,38 +156,43 @@ class BeatTracker:
         elif self.last_signal and now-self.last_signal > self.end_silence:
             self.song_end = True
             self.ended_bpm = self.bpm
-            self.bpm=0.; self.flux.clear(); self.history.clear(); self.tempo_candidates.clear(); self.last_signal=0.
+            self.bpm=0.; self.flux.clear(); self.high_flux.clear(); self.history.clear(); self.tempo_candidates.clear(); self.last_signal=0.
             self.manual_bpm=0.
             self.phase=0.; self.last_grid=None; self.onsets.clear()
             self.last_tempo_check=0.; self.last_phase_adjust=0.
+            self.octave_uncertain=False
             self.shape_target=.12
         # Slowly return toward a slender, tall resting shape between accents.
         self.shape_target += (.12-self.shape_target) * min(1., dt*1.8)
         self.shape += (self.shape_target-self.shape) * min(1., dt*12.)
         spectrum = np.abs(np.fft.rfft(x * np.hanning(len(x)))) if len(x) else np.zeros(1)
+        high_value=0.
         if self.prev is None: value = 0.
         else:
             delta = np.maximum(spectrum-self.prev, 0)
             frequencies = np.fft.rfftfreq(len(x), 1/self.rate)
             low = delta[(frequencies >= 40) & (frequencies < 160)]
             mid = delta[(frequencies >= 160) & (frequencies < 1500)]
+            high = delta[(frequencies >= 2500) & (frequencies < 10000)]
             value = float((low.mean() if len(low) else 0)*.8 + (mid.mean() if len(mid) else 0)*.2)
+            high_value=float(high.mean()) if len(high) else 0.
         self.prev = spectrum
         threshold = max(.012, float(np.mean(self.history)) + 1.15*float(np.std(self.history))) * self.analysis_bias if len(self.history)>10 else float('inf')
         peak_flux, peak_threshold = self.prev_flux, self.prev_threshold
         onset = (peak_flux > self.prev_prev_flux and peak_flux >= value and
                  peak_flux > peak_threshold and now-self.last_onset > .18 and self.level > .008)
         self.prev_prev_flux, self.prev_flux, self.prev_threshold = peak_flux, value, threshold
-        self.history.append(value); self.flux.append(value); self.steps += 1
+        self.history.append(value); self.flux.append(value); self.high_flux.append(high_value); self.steps += 1
         if onset:
             self.last_onset = now
             strength = float(np.clip((peak_flux-peak_threshold)/(peak_threshold+1e-6), 0., 3.))
-            self.onsets.append((now, strength))
+            onset_time=now-self.chunk/self.rate
+            self.onsets.append((onset_time, strength))
             # 0 = slender/tall, 1 = broad/flat. Keep this as a continuous state.
             self.shape_target = float(np.clip(.18 + .82*(strength/3.), .18, 1.))
             if self.bpm and self.phase:
                 period = 60/self.bpm
-                error = (now-self.phase+period/2) % period-period/2
+                error = (onset_time-self.phase+period/2) % period-period/2
                 if abs(error) < min(.09, period*.18) and strength > .35 and now-self.last_phase_adjust >= self.correction_interval(self.phase_correction,True):
                     self.phase += error*.12
                     self.last_phase_adjust=now
@@ -177,11 +201,18 @@ class BeatTracker:
         if check_tempo and len(self.flux)>6*self.rate/self.chunk:
             self.last_tempo_check=now
             v = np.asarray(self.flux); v = v - v.mean(); corr = np.correlate(v, v, mode='full')[len(v)-1:]
-            lo=int(60*self.rate/(220*self.chunk)); hi=min(len(corr)-2,int(60*self.rate/(60*self.chunk)))
+            nfft=4096
+            rhythm=np.abs(np.fft.rfft(v*np.hanning(len(v)),n=nfft))
+            rhythm_freq=np.fft.rfftfreq(nfft,self.chunk/self.rate)
+            hv=np.asarray(self.high_flux); hv=hv-hv.mean()
+            high_rhythm=np.abs(np.fft.rfft(hv*np.hanning(len(hv)),n=nfft))
+            lo=math.ceil(60*self.rate/(220*self.chunk)); hi=min(len(corr)-2,math.floor(60*self.rate/(55*self.chunk)))
             if hi>lo and corr[0]>.0001:
                 lags=np.arange(lo,hi+1); tempos=60*self.rate/(lags*self.chunk)
                 weights=np.exp(-.5*(np.log2(tempos/120)/.9)**2)
                 score=corr[lo:hi+1]*weights
+                periodicity=np.interp(tempos/60,rhythm_freq,rhythm)+1.1*np.interp(tempos/120,rhythm_freq,rhythm)
+                score *= .1+.9*periodicity/max(1e-9,float(periodicity.max()))
                 if self.bpm:
                     score *= .65 + .35*np.exp(-.5*(np.log2(tempos/self.bpm)/.18)**2)
                 if len(self.onsets)>=8:
@@ -193,11 +224,38 @@ class BeatTracker:
                             support=np.exp(-.5*((intervals[:,None]-periods[None,:])/(periods[None,:]*.16))**2).mean(axis=0)
                             score*=.55+.9*support
                 lag=lo+int(np.argmax(score))
+                # A three-beat cycle can otherwise win over a stronger two-beat pulse.
+                faster_lag=round(lag*2/3)
+                if not self.bpm and 60*self.rate/(lag*self.chunk)<100 and lo<=faster_lag<=hi:
+                    candidate_range=range(max(lo,faster_lag-1),min(hi,faster_lag+1)+1)
+                    faster_lag=max(candidate_range,key=lambda n:score[n-lo])
+                    if (score[faster_lag-lo]>=.75*score[lag-lo] and
+                            periodicity[faster_lag-lo]>1.25*periodicity[lag-lo]):
+                        lag=faster_lag
+                tempo=60*self.rate/(lag*self.chunk)
+                half_lag=round(lag*2)
+                if not self.bpm and tempo>=115 and half_lag<=hi and corr[lag]>0:
+                    window_start=max(lo,half_lag-3); window_end=min(hi,half_lag+3)
+                    half_lag=window_start+int(np.argmax(corr[window_start:window_end+1]))
+                    relative=corr[half_lag]/corr[lag]
+                    full=float(np.interp(tempo/60,rhythm_freq,rhythm))
+                    half=float(np.interp(tempo/120,rhythm_freq,rhythm))
+                    accent=half/max(full,1e-9)
+                    high_full=float(np.interp(tempo/60,rhythm_freq,high_rhythm))
+                    high_half=float(np.interp(tempo/120,rhythm_freq,high_rhythm))
+                    high_support=(high_full>1.15*max(high_half,1e-9) and
+                                  high_full>.05*max(1e-9,float(high_rhythm.max())) and
+                                  float(np.mean(self.high_flux))>.01*max(1e-9,float(np.mean(self.flux))))
+                    learned=local_half_tempo_preference(self.examples,tempo)
+                    if relative>=.70 and (accent>=.18 or learned): self.octave_uncertain=True
+                    if relative>=.70 and (learned or (accent>=.28 and not high_support)): lag=half_lag
                 if self.octave_bias:
                     other=round(lag*(2 if self.octave_bias==-1 else .5))
                     if lo<=other<=hi and score[other-lo]>=.85*score[lag-lo]:
                         lag=other
-                if corr[lag]/corr[0]>.05:
+                ready=not (not self.bpm and self.octave_uncertain and len(v)<14*self.rate/self.chunk)
+                if not ready: self.tempo_candidates.clear()
+                if ready and corr[lag]/corr[0]>.05:
                     den=corr[lag-1]-2*corr[lag]+corr[lag+1]
                     offset=float(np.clip(.5*(corr[lag-1]-corr[lag+1])/den,-.5,.5)) if den else 0
                     candidate=60*self.rate/((lag+offset)*self.chunk); self.tempo_candidates.append(candidate)
@@ -241,16 +299,27 @@ class BeatTracker:
         position=(np.angle(vector)%(2*math.pi))/(2*math.pi)*period
         self.phase=now-((now-position)%period)
 
+    def shift_clock(self, seconds):
+        for name in ('last_signal','last_onset','last_time','phase','beat','last_tempo_check','last_phase_adjust'):
+            value=getattr(self,name)
+            if value: setattr(self,name,value+seconds)
+        if self.last_visual > -1e8: self.last_visual+=seconds
+        self.onsets=deque(((t+seconds,s) for t,s in self.onsets),maxlen=self.onsets.maxlen)
+
 class Analyzer:
-    def __init__(self, source, events, analysis_bias=1.0, fast_bpm_threshold=190, end_silence=3.5, octave_bias=0, bpm_correction='auto', phase_correction='auto'):
+    def __init__(self, source, events, analysis_bias=1.0, fast_bpm_threshold=190, end_silence=3.5, octave_bias=0, bpm_correction='auto', phase_correction='auto', examples=None):
         self.source, self.events, self.analysis_bias = source, events, analysis_bias
         self.fast_bpm_threshold=fast_bpm_threshold; self.end_silence=end_silence; self.octave_bias=octave_bias; self.reset_epoch=0
         self.bpm_correction=bpm_correction; self.phase_correction=phase_correction
+        self.examples=list(examples or [])
         self.manual_bpm=0.; self.last_audible=0.; self.auto_estimate=0.
         self.align_epoch=0
+        self.media=MediaMonitor(source[1][1]) if source[0]=='process' and source[1][1].lower() in ('cloudmusic.exe','qqmusic.exe') else None
         self.running = True; self.bpm = 0.; self.level = 0.; self.lastbeat = 0.; self.shape = .12; self.beat_strength = .8; self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.run, daemon=True); self.thread.start()
-    def stop(self): self.running = False
+    def stop(self):
+        self.running = False
+        if self.media: self.media.stop()
     def values(self):
         with self.lock: return self.bpm, self.level, self.lastbeat, self.shape, self.beat_strength
     def is_playing(self):
@@ -275,25 +344,50 @@ class Analyzer:
                 def callback(data, frame_count, time_info, status):
                     push(data); return (None, pa.paContinue)
                 stream=p.open(format=pa.paFloat32, channels=channels, rate=rate, input=True, input_device_index=idx, frames_per_buffer=chunk, stream_callback=callback)
-            tracker=BeatTracker(rate,chunk,self.analysis_bias,self.fast_bpm_threshold,self.end_silence,self.octave_bias); pending=np.empty(0,dtype=np.float32); last_data_time=time.monotonic(); song_end_reported=False; ended_without_data=False; seen_epoch=self.reset_epoch; seen_align=self.align_epoch
+            tracker=BeatTracker(rate,chunk,self.analysis_bias,self.fast_bpm_threshold,self.end_silence,self.octave_bias,examples=self.examples); pending=np.empty(0,dtype=np.float32); last_data_time=time.monotonic(); song_end_reported=False; ended_without_data=False; seen_epoch=self.reset_epoch; seen_align=self.align_epoch
+            media_track=None; media_stopped=False; paused_at=0.
             self.events.put(('status', '正在监听：' + name))
             while self.running:
                 if seen_epoch != self.reset_epoch:
-                    seen_epoch=self.reset_epoch; tracker=BeatTracker(rate,chunk,self.analysis_bias,self.fast_bpm_threshold,self.end_silence,self.octave_bias)
+                    seen_epoch=self.reset_epoch; tracker=BeatTracker(rate,chunk,self.analysis_bias,self.fast_bpm_threshold,self.end_silence,self.octave_bias,examples=self.examples)
                     self.manual_bpm=0.; self.last_audible=0.; self.auto_estimate=0.
                     pending=np.empty(0,dtype=np.float32); song_end_reported=False; ended_without_data=False
                     try:
                         while True: audio_queue.get_nowait()
                     except queue.Empty: pass
                     with self.lock: self.bpm=0.; self.lastbeat=0.; self.shape=.12; self.beat_strength=.8
+                media=self.media.snapshot() if self.media else None
+                if media and media.get('track'):
+                    if media_track and media['track'] != media_track:
+                        if tracker.bpm and not media_stopped: self.events.put(('song_end', self.auto_estimate or tracker.bpm))
+                        self.events.put(('song_changed',None))
+                        tracker=BeatTracker(rate,chunk,self.analysis_bias,self.fast_bpm_threshold,self.end_silence,self.octave_bias,examples=self.examples)
+                        self.manual_bpm=0.; self.auto_estimate=0.; self.last_audible=0.; self.events.put(('manual_unlock',None))
+                        pending=np.empty(0,dtype=np.float32); song_end_reported=False; paused_at=0.; media_stopped=False
+                    media_track=media['track']
+                state=media.get('state') if media else None
+                if state in ('paused','stopped'):
+                    if not paused_at: paused_at=time.monotonic()
+                    if state=='stopped' and not media_stopped:
+                        if tracker.bpm: self.events.put(('song_end',self.auto_estimate or tracker.bpm))
+                        tracker=BeatTracker(rate,chunk,self.analysis_bias,self.fast_bpm_threshold,self.end_silence,self.octave_bias,examples=self.examples)
+                        self.manual_bpm=0.; self.auto_estimate=0.; self.events.put(('manual_unlock',None)); media_stopped=True
+                    self.last_audible=0.
+                    with self.lock: self.level=0.; self.lastbeat=0.
+                    try: audio_queue.get(timeout=.2)
+                    except queue.Empty: pass
+                    continue
+                if paused_at:
+                    tracker.shift_clock(time.monotonic()-paused_at); paused_at=0.; last_data_time=time.monotonic()
+                    pending=np.empty(0,dtype=np.float32); media_stopped=False
                 try: data=audio_queue.get(timeout=.2)
                 except queue.Empty:
                     with self.lock: self.level=0
-                    if not ended_without_data and time.monotonic()-last_data_time > self.end_silence:
+                    if state!='playing' and not ended_without_data and time.monotonic()-last_data_time > self.end_silence:
                         ended_without_data=True
                         if tracker.bpm > 0 and not song_end_reported:
                             song_end_reported=True; self.events.put(('song_end', self.auto_estimate or tracker.bpm))
-                        tracker=BeatTracker(rate,chunk,self.analysis_bias,self.fast_bpm_threshold,self.end_silence,self.octave_bias); pending=np.empty(0,dtype=np.float32)
+                        tracker=BeatTracker(rate,chunk,self.analysis_bias,self.fast_bpm_threshold,self.end_silence,self.octave_bias,examples=self.examples); pending=np.empty(0,dtype=np.float32)
                         self.manual_bpm=0.; self.last_audible=0.; self.auto_estimate=0.; self.events.put(('manual_unlock',None))
                         with self.lock: self.bpm=0.; self.lastbeat=0.; self.shape=.12; self.beat_strength=.8
                     continue
@@ -307,8 +401,9 @@ class Analyzer:
                     now=time.monotonic()-len(pending)/rate
                     tracker.analysis_bias=self.analysis_bias
                     tracker.fast_bpm_threshold=self.fast_bpm_threshold
-                    tracker.end_silence=self.end_silence
+                    tracker.end_silence=float('inf') if state=='playing' else self.end_silence
                     tracker.bpm_correction=self.bpm_correction; tracker.phase_correction=self.phase_correction
+                    tracker.examples=self.examples
                     if seen_align != self.align_epoch:
                         seen_align=self.align_epoch
                         if tracker.bpm and any(now-t < 12 for t,_ in tracker.onsets):
@@ -536,8 +631,17 @@ class App:
         self.tray = None
         self.feedback_dialog = None
         self.settings_window = None
+        self.image_picker = None
         self.sprites = []
         self.image_cache = {}
+        self.picker_thumbnails = {}
+        recent=self.config.get('recent_images')
+        if not isinstance(recent,list):
+            recent=[self.config.get('image','')]
+            windows=self.config.get('windows',[])
+            if isinstance(windows,list): recent.extend(record.get('image','') for record in windows if isinstance(record,dict))
+        self.recent_images=[p for p in recent if isinstance(p,str) and os.path.isfile(p)][:30] if isinstance(recent,list) else []
+        self.recent_images=list(dict.fromkeys(self.recent_images))
         self.frame_cache = {}
         self.resize_cache = OrderedDict()
         self.loading_source_frames=[]; self.loading_durations=[]; self.loading_cache={}
@@ -558,6 +662,7 @@ class App:
         self.flash_started = -1e9
         self.bpm_notice_started = -1e9; self.bpm_notice_value = 0
         self.update_busy = False; self.update_release = None
+        self.setup_install = os.path.isfile(os.path.join(BASE,'.bounce-installed'))
         self.shared_image_path = self.config.get('image','')
         self.shared_original = self.get_image(self.shared_image_path)
         self.source_mode = tk.StringVar(value='process' if process_capture_supported() else 'device')
@@ -573,7 +678,9 @@ class App:
             self.fps.set('30')
         self.fast_bpm_threshold=tk.IntVar(value=max(80,min(240,int(self.config.get('fast_bpm_threshold',190)))))
         self.amplitude = tk.DoubleVar(value=amplitude_from_config(self.config))
-        self.offset = tk.DoubleVar(value=self.config.get('offset',0))
+        # Manual alignment is temporary for the current song; previous songs do not leak into the next one.
+        self.offset = tk.DoubleVar(value=0.)
+        self.offset_label=tk.StringVar(value='自动对齐')
         self.top = tk.BooleanVar(value=self.config.get('top',True))
         self.top_value = self.top.get()
         self.size = tk.IntVar(value=self.config.get('size',240))
@@ -766,6 +873,8 @@ class App:
         ttk.Radiobutton(row,text='使用统一图片',variable=self.image_mode,value='uniform',command=self.set_image_mode).pack(side='left',padx=8)
         ttk.Radiobutton(row,text='使用多种图片',variable=self.image_mode,value='multiple',command=self.set_image_mode).pack(side='left')
         row=ttk.Frame(main); row.pack(fill='x',pady=4)
+        self.image_picker_button=ttk.Button(row,text='选择图片',command=self.show_image_picker)
+        self.image_picker_button.pack(side='left',padx=(0,7))
         ttk.Button(row,text='导入图片',command=self.import_image).pack(side='left')
         ttk.Button(row,text='新增Q弹',command=self.add_sprite).pack(side='left',padx=7)
         ttk.Button(row,text='关闭所选图片',command=self.close_selected_sprite).pack(side='left')
@@ -784,12 +893,13 @@ class App:
                  highlightthickness=0).grid(row=0,column=1,sticky='ew',padx=8)
         ttk.Label(row,textvariable=self.amplitude,width=7,anchor='e').grid(row=0,column=2)
         ttk.Label(row,text='%').grid(row=0,column=3,padx=(4,0))
-        row=ttk.Frame(main); row.pack(fill='x',pady=5); row.columnconfigure(1,weight=1)
-        ttk.Label(row,text='节奏偏移',width=12,anchor='w').grid(row=0,column=0,sticky='w')
-        tk.Scale(row,variable=self.offset,from_=-.25,to=.25,resolution=.01,orient='horizontal',showvalue=False,
-                 highlightthickness=0).grid(row=0,column=1,sticky='ew',padx=8)
-        ttk.Label(row,textvariable=self.offset,width=7,anchor='e').grid(row=0,column=2)
-        ttk.Label(row,text='秒').grid(row=0,column=3,padx=(4,0))
+        row=ttk.Frame(main); row.pack(fill='x',pady=5)
+        ttk.Label(row,text='本曲节奏微调',width=14).pack(side='left')
+        ttk.Button(row,text='提前一点',command=lambda:self.adjust_offset(-.02)).pack(side='left')
+        ttk.Button(row,text='延后一点',command=lambda:self.adjust_offset(.02)).pack(side='left',padx=5)
+        ttk.Button(row,text='恢复自动',command=self.reset_alignment).pack(side='left')
+        ttk.Label(row,textvariable=self.offset_label).pack(side='left',padx=10)
+        ttk.Label(main,text='微调只影响当前播放；停止或检测到换曲后恢复。',foreground='#666666').pack(anchor='w')
         ttk.Checkbutton(main,text='歌曲结束后询问节奏与 BPM 是否匹配（用于校准分析）',variable=self.feedback_enabled,command=self.save).pack(anchor='w',pady=(2,3))
         ttk.Label(main,textvariable=self.status,wraplength=550,foreground='#34596a').pack(anchor='w')
 
@@ -929,8 +1039,10 @@ class App:
             if not hasattr(self,'default_image'): self.default_image=slime()
             return self.default_image
         if path not in self.image_cache:
-            self.image_cache[path]=SpriteWindow.load_image(path)
+            self.image_cache[path]=SpriteWindow.load_image(MATOU_IMAGE if path=='preset:matou' else path)
         return self.image_cache[path]
+    def image_name(self,path):
+        return '默认图片' if not path else ('玛头' if path=='preset:matou' else os.path.basename(path))
     def render_source(self, original, size):
         limit=max(128,int(size*1.4)); key=(id(original),limit)
         if key not in self.resize_cache:
@@ -987,7 +1099,7 @@ class App:
         self.sprite_list.delete(0,tk.END)
         for sprite in self.sprites:
             path=self.shared_image_path if self.image_mode.get()=='uniform' else sprite.image_path
-            name=os.path.basename(path) if path else '默认图'
+            name=self.image_name(path)
             self.sprite_list.insert(tk.END,f'图片 {sprite.id} · {name}')
         if self.selected_id is not None: self.select_sprite(self.selected_id)
         self.refresh_loading_targets()
@@ -997,7 +1109,7 @@ class App:
             self.loading_target['values']=['统一图片']
             self.loading_target.current(0)
         else:
-            values=[f'图片 {sprite.id} · {os.path.basename(sprite.image_path) or "默认图"}' for sprite in self.sprites]
+            values=[f'图片 {sprite.id} · {self.image_name(sprite.image_path)}' for sprite in self.sprites]
             self.loading_target['values']=values or ['默认图']
             index=next((i for i,sprite in enumerate(self.sprites) if sprite.id==self.selected_id),0)
             self.loading_target.current(index)
@@ -1011,19 +1123,88 @@ class App:
             path=filedialog.askopenfilename(parent=self.root,title='为新窗口选择图片（取消则使用默认图）',filetypes=[('图片','*.png *.jpg *.jpeg *.webp *.bmp *.gif'),('所有文件','*.*')])
         x=800+35*len(self.sprites); y=250+35*len(self.sprites)
         sprite=self.make_sprite(path,self.size.get(),x,y)
+        if path: self.remember_image(path)
         self.refresh_sprite_list(); self.select_sprite(sprite.id); self.save()
     def import_image(self):
         path=filedialog.askopenfilename(parent=self.root,title='导入图片',filetypes=[('图片','*.png *.jpg *.jpeg *.webp *.bmp *.gif'),('所有文件','*.*')])
         if not path: return
+        self.choose_image(path,remember=True)
+    def remember_image(self,path):
+        self.recent_images=[p for p in self.recent_images if os.path.normcase(p)!=os.path.normcase(path)]
+        self.recent_images.insert(0,path); del self.recent_images[30:]
+    def picker_thumbnail(self,path):
+        if path not in self.picker_thumbnails:
+            try:
+                if not path: image=slime()
+                else:
+                    with Image.open(MATOU_IMAGE if path=='preset:matou' else path) as opened:
+                        opened.seek(0); opened.draft('RGB',(72,72)); image=ImageOps.exif_transpose(opened).convert('RGBA')
+                image.thumbnail((58,58),Image.Resampling.LANCZOS)
+                self.picker_thumbnails[path]=ImageTk.PhotoImage(image)
+            except Exception: self.picker_thumbnails[path]=ImageTk.PhotoImage(slime().resize((58,52)))
+        return self.picker_thumbnails[path]
+    def show_image_picker(self):
+        if self.image_picker and self.image_picker.winfo_exists():
+            self.image_picker.destroy(); self.image_picker=None; return
+        picker=tk.Toplevel(self.root); self.image_picker=picker
+        picker.overrideredirect(True); picker.attributes('-topmost',True)
+        shell=ttk.Frame(picker,padding=8,relief='solid',borderwidth=1); shell.pack(fill='both',expand=True)
+        header=ttk.Frame(shell); header.pack(fill='x')
+        ttk.Label(header,text='选择图片',font=('Microsoft YaHei UI',10,'bold')).pack(side='left')
+        ttk.Button(header,text='×',width=3,command=picker.destroy).pack(side='right')
+        body=ttk.Frame(shell); body.pack(fill='both',expand=True)
+        def tile(parent,path,column,row):
+            button=ttk.Button(parent,text=self.image_name(path),image=self.picker_thumbnail(path),compound='top',
+                              width=11,command=lambda p=path:self.choose_image(p))
+            button.grid(row=row,column=column,padx=3,pady=3,sticky='nsew')
+            return button
+        def populate(expanded=False):
+            for child in body.winfo_children(): child.destroy()
+            ttk.Label(body,text='预设图片').pack(anchor='w',pady=(4,0))
+            presets=ttk.Frame(body); presets.pack(anchor='w')
+            tile(presets,'',0,0); tile(presets,'preset:matou',1,0)
+            ttk.Label(body,text='最近图片').pack(anchor='w',pady=(7,0))
+            if not self.recent_images:
+                ttk.Label(body,text='导入图片后会显示在这里。',foreground='#777777').pack(anchor='w',pady=6); return
+            if expanded:
+                wrap=ttk.Frame(body); wrap.pack(fill='both',expand=True)
+                canvas=tk.Canvas(wrap,width=360,height=240,highlightthickness=0,
+                                 bg='#202329' if self.theme_mode.get()=='dark' else '#f3f3f3')
+                bar=ttk.Scrollbar(wrap,orient='vertical',command=canvas.yview)
+                canvas.configure(yscrollcommand=bar.set); canvas.pack(side='left',fill='both',expand=True); bar.pack(side='right',fill='y')
+                grid=ttk.Frame(canvas); canvas.create_window((0,0),window=grid,anchor='nw')
+                grid.bind('<Configure>',lambda event:canvas.configure(scrollregion=canvas.bbox('all')))
+                def scroll(event): canvas.yview_scroll(-int(event.delta/120),'units')
+                canvas.bind('<MouseWheel>',scroll); grid.bind('<MouseWheel>',scroll)
+                for i,path in enumerate(self.recent_images): tile(grid,path,i%3,i//3).bind('<MouseWheel>',scroll)
+            else:
+                grid=ttk.Frame(body); grid.pack(anchor='w')
+                for i,path in enumerate(self.recent_images[:5]): tile(grid,path,i%3,i//3)
+                if len(self.recent_images)>5:
+                    ttk.Button(grid,text='…',width=11,command=lambda:populate(True)).grid(row=1,column=2,padx=3,pady=3,sticky='nsew')
+        populate()
+        picker.bind('<Escape>',lambda event:picker.destroy()); self.apply_theme()
+        picker.update_idletasks()
+        x=self.image_picker_button.winfo_rootx()+self.image_picker_button.winfo_width()+8
+        y=self.image_picker_button.winfo_rooty()
+        x=max(0,min(x,picker.winfo_screenwidth()-picker.winfo_reqwidth()))
+        y=max(0,min(y,picker.winfo_screenheight()-picker.winfo_reqheight()))
+        picker.geometry(f'+{x}+{y}'); picker.lift()
+    def choose_image(self,path,remember=False):
+        if path and not path.startswith('preset:') and not os.path.isfile(path):
+            self.status.set('图片文件不存在，请重新导入。'); return
         try:
-            self.image_cache.pop(path,None)
+            if remember:
+                self.image_cache.pop(path,None); self.picker_thumbnails.pop(path,None)
             original=self.get_image(path)
             if self.image_mode.get()=='uniform': self.shared_image_path=path; self.shared_original=original
             else:
                 sprite=self.selected_sprite()
                 if not sprite: sprite=self.make_sprite()
                 sprite.image_path=path; sprite.original=original
+            if remember: self.remember_image(path)
             self.prune_image_cache(); self.refresh_sprite_list(); self.update_loading_preview(); self.save()
+            if self.image_picker and self.image_picker.winfo_exists(): self.image_picker.destroy(); self.image_picker=None
         except Exception as error: messagebox.showerror('图片导入失败',str(error),parent=self.root)
     def set_image_mode(self):
         self.refresh_sprite_list(); self.sync_loading_position(); self.save()
@@ -1063,6 +1244,14 @@ class App:
             self.status.set('请先播放音乐并等待 BPM 识别完成。'); return
         self.analyzer.realign()
         self.status.set('正在根据近期鼓点重新对齐节奏……')
+    def adjust_offset(self,amount):
+        value=round(max(-.25,min(.25,self.offset.get()+amount)),2)
+        self.offset.set(value)
+        self.offset_label.set('自动对齐' if not value else ('提前 ' if value<0 else '延后 ')+f'{abs(value):.2f} 秒')
+    def reset_alignment(self):
+        self.offset.set(0.); self.offset_label.set('自动对齐')
+        if self.analyzer and self.analyzer.is_playing() and self.analyzer.values()[0]: self.realign_rhythm()
+        else: self.status.set('已恢复自动对齐。')
     def set_fast_threshold(self,value=None):
         if self.analyzer:
             self.analyzer.fast_bpm_threshold=self.fast_bpm_threshold.get()
@@ -1086,6 +1275,7 @@ class App:
         del examples[:-50]
         if self.analyzer:
             self.analyzer.octave_bias=learned_octave_bias(examples)
+            self.analyzer.examples=list(examples)
             if source=='feedback' and not self.analyzer.is_playing():
                 self.analyzer.reset_epoch+=1
     def apply_manual_bpm(self,learn=False):
@@ -1109,10 +1299,10 @@ class App:
     def clear_analysis_data(self):
         self.analysis_bias=1.
         self.config.pop('feedback_counts',None); self.config.pop('tempo_corrections',None)
-        self.config.pop('bpm_examples',None); self.offset.set(0)
+        self.config.pop('bpm_examples',None); self.offset.set(0); self.offset_label.set('自动对齐')
         self.flash_started=-1e9
         if self.analyzer:
-            self.analyzer.analysis_bias=1.; self.analyzer.reset_epoch+=1
+            self.analyzer.analysis_bias=1.; self.analyzer.octave_bias=0; self.analyzer.examples=[]; self.analyzer.reset_epoch+=1
         self.clear_manual_bpm()
         self.status.set('学习记录、BPM 锁定和对轨状态已清除。')
         self.save()
@@ -1149,7 +1339,7 @@ class App:
                 self.update_status.set('源码运行模式请从发布页下载便携包。'); return
             self.update_busy=True; self.update_status.set('正在下载并校验更新，请稍候……')
             def worker():
-                try: self.events.put(('update_ready',updater.prepare_update(release)))
+                try: self.events.put(('update_ready',updater.prepare_update(release,self.setup_install)))
                 except Exception as error: self.events.put(('update_error',str(error)))
             threading.Thread(target=worker,daemon=True).start()
         ttk.Button(row,text='更新并重启',command=accept).pack(side='left')
@@ -1225,14 +1415,15 @@ class App:
             return
         i=self.combo.current()
         if i<0: messagebox.showwarning('音频源','请先选择音频源。',parent=self.root); return
-        self.stop(); source=self.sources[i]; mode=self.source_mode.get()
+        self.stop(); self.reset_alignment(); source=self.sources[i]; mode=self.source_mode.get()
         octave_bias=learned_octave_bias(self.config.get('bpm_examples',[]))
-        self.analyzer=Analyzer((mode,source),self.events,self.analysis_bias,self.fast_bpm_threshold.get(),self.end_silence.get(),octave_bias,self.bpm_correction.get(),self.phase_correction.get())
+        self.analyzer=Analyzer((mode,source),self.events,self.analysis_bias,self.fast_bpm_threshold.get(),self.end_silence.get(),octave_bias,self.bpm_correction.get(),self.phase_correction.get(),self.config.get('bpm_examples',[]))
         self.config['process' if mode=='process' else 'device']=source[1]
         self.save()
     def stop(self):
         if self.analyzer: self.analyzer.stop(); self.analyzer=None
         self.clear_manual_bpm()
+        self.offset.set(0.); self.offset_label.set('自动对齐')
         self.bpmtext.set('BPM：--'); self.status.set('已停止监听')
     def stop_and_rate(self):
         bpm=(self.analyzer.auto_estimate or self.analyzer.values()[0]) if self.analyzer else 0.
@@ -1285,7 +1476,7 @@ class App:
                 loading_x=self.shared_loading_x, loading_y=self.shared_loading_y,
                 main_geometry=f'{max(610,self.root.winfo_width())}x{max(610,self.root.winfo_height())}',
                 size=self.size.get(), fps=int(self.fps.get()), amplitude=self.amplitude.get(), amplitude_scale_version=2,
-                offset=self.offset.get(), feedback_enabled=self.feedback_enabled.get(),
+                offset=0., feedback_enabled=self.feedback_enabled.get(),
                 end_silence=self.end_silence.get(),
                 fast_bpm_threshold=self.fast_bpm_threshold.get(),
                 analysis_bias=self.analysis_bias, double_click_close=self.double_click_close.get(),
@@ -1294,6 +1485,7 @@ class App:
                 notice_enabled=self.notice_enabled.get(), notice_color=self.notice_color, notice_duration=self.notice_duration.get(),
                 notice_outline=self.notice_outline.get(), notice_outline_color=self.notice_outline_color, theme_mode=self.theme_mode.get(),
                 bpm_correction=self.bpm_correction.get(), phase_correction=self.phase_correction.get())
+            self.config['recent_images']=self.recent_images
             with open(CONFIG,'w',encoding='utf-8') as file:
                 json.dump(self.config,file,ensure_ascii=False,indent=2)
         except Exception: pass
@@ -1329,7 +1521,10 @@ class App:
                     elif self.source_mode.get()=='process':
                         self.status.set('未检测到播放中的声音，请确认播放器正在播放并重新查找。')
                 elif kind=='song_end':
+                    self.offset.set(0.); self.offset_label.set('自动对齐')
                     if self.feedback_enabled.get(): self.song_feedback(value)
+                elif kind=='song_changed':
+                    self.offset.set(0.); self.offset_label.set('自动对齐')
                 elif kind=='manual_unlock': self.clear_manual_bpm()
                 elif kind=='bpm_locked':
                     if self.flash_enabled.get(): self.flash_started=time.monotonic()
@@ -1340,7 +1535,7 @@ class App:
                     self.update_busy=False
                     try:
                         if updater.version_tuple(value['tag_name']) > updater.version_tuple(VERSION):
-                            updater.release_asset(value)
+                            updater.release_asset(value,self.setup_install)
                             self.update_status.set('发现新版本 '+value['tag_name']); self.show_update(value)
                         else: self.update_status.set('当前已是最新版本。')
                     except Exception as error: self.update_status.set('检查更新失败：'+str(error))
@@ -1349,7 +1544,7 @@ class App:
                 elif kind=='update_ready':
                     self.update_busy=False
                     try:
-                        self.save(); updater.launch_updater(value,BASE,os.getpid()); self.quit(); return
+                        self.save(); updater.launch_updater(value,BASE,os.getpid(),self.setup_install); self.quit(); return
                     except Exception as error: self.update_status.set('无法启动更新：'+str(error))
                 elif kind=='status': self.status.set(value)
                 elif kind=='error': self.status.set(value); self.bpmtext.set('BPM：--')
@@ -1360,7 +1555,8 @@ class App:
         now=time.monotonic(); dt=min(.2,max(.001,now-self.last_frame_time)); self.last_frame_time=now
         active=bool(playing and level>.002 and beat)
         amp=animation_amplitude(self.amplitude.get()) if active else 0.
-        shift=self.offset.get(); event_time=beat+shift if beat else -1e9
+        # The squash reaches its peak after its attack; predict the grid to center it on the beat.
+        shift=self.offset.get()-.08; event_time=beat+shift if beat else -1e9
         if beat and bpm and shift<0:
             interval=max(1,math.ceil(bpm/self.fast_bpm_threshold.get()))*60/bpm
             next_time=beat+interval+shift

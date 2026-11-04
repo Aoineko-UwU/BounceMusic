@@ -46,12 +46,19 @@ def test_window_and_image_flow():
                 assert module.animation_amplitude(50) == .625 and module.animation_amplitude(150) == 1.875
                 application.root.geometry('800x720')
                 application.root.update()
-                for name in ('动画幅度','节奏偏移'):
+                for name in ('动画幅度',):
                     label=find_label(application.root,name)
                     scale=next(child for child in label.master.winfo_children() if isinstance(child,module.tk.Scale))
                     label_mid=label.winfo_rooty()+label.winfo_height()/2
                     scale_mid=scale.winfo_rooty()+scale.winfo_height()/2
                     assert abs(label_mid-scale_mid)<3
+                assert application.offset_label.get() == '自动对齐'
+                application.adjust_offset(-.02)
+                assert application.offset.get() == -.02 and '提前' in application.offset_label.get()
+                application.adjust_offset(.04)
+                assert application.offset.get() == .02 and '延后' in application.offset_label.get()
+                application.reset_alignment()
+                assert application.offset.get() == 0 and application.offset_label.get() == '自动对齐'
                 application.image_mode.set('multiple')
                 first = application.make_sprite(image_path, 240, 100, 100)
                 second = application.make_sprite(image_path, 240, 400, 100)
@@ -210,9 +217,45 @@ def test_single_instance_mutex():
     try: assert module.acquire_single_instance() is None
     finally: ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(first))
 
+def test_image_picker_presets_and_recent():
+    with tempfile.TemporaryDirectory() as directory:
+        config=str(Path(directory)/'设置.json')
+        with patch.object(module,'CONFIG',config),patch.object(module.App,'make_tray'),patch.object(module.App,'refresh_sources'):
+            application=module.App()
+            try:
+                application.choose_image('preset:matou')
+                assert application.shared_image_path=='preset:matou'
+                assert max(application.shared_original.size)<=module.MAX_IMAGE_SIDE
+                path=str(Path(directory)/'custom.png')
+                Image.new('RGBA',(100,100),'red').save(path)
+                application.choose_image(path,remember=True)
+                assert application.recent_images[0]==path
+                assert json.loads(Path(config).read_text(encoding='utf-8'))['recent_images']==[path]
+                application.show_image_picker(); application.root.update()
+                assert application.image_picker and application.image_picker.winfo_exists()
+                assert set(application.picker_thumbnails) >= {'','preset:matou',path}
+                application.choose_image('')
+                assert application.shared_image_path==''
+                assert not application.image_picker
+                for i in range(6):
+                    other=str(Path(directory)/f'image-{i}.png')
+                    Image.new('RGBA',(16,16),'blue').save(other)
+                    application.remember_image(other)
+                application.show_image_picker(); application.root.update()
+                def find_button(widget,label):
+                    if isinstance(widget,module.ttk.Button) and widget.cget('text')==label: return widget
+                    return next((found for child in widget.winfo_children() if (found:=find_button(child,label))),None)
+                more=find_button(application.image_picker,'…'); assert more
+                more.invoke(); application.root.update()
+                def contains_canvas(widget):
+                    return isinstance(widget,module.tk.Canvas) or any(contains_canvas(child) for child in widget.winfo_children())
+                assert contains_canvas(application.image_picker)
+            finally: application.quit()
+
 
 if __name__ == '__main__':
     test_window_and_image_flow()
     test_windows_10_uses_device_mode()
     test_single_instance_mutex()
+    test_image_picker_presets_and_recent()
     print('UI checks passed.')

@@ -1,4 +1,4 @@
-param([string]$Stage, [string]$Install, [int]$AppPid)
+param([string]$Stage, [string]$Install, [int]$AppPid, [switch]$SetupMode)
 $ErrorActionPreference = 'Stop'
 $backup = Join-Path $Install ('.bounce-update-backup-' + $PID)
 $files = @('BounceMusic.exe', '_internal', 'ProcTap-LICENSE.txt')
@@ -7,6 +7,14 @@ $installed = @()
 try {
     Wait-Process -Id $AppPid -Timeout 30 -ErrorAction SilentlyContinue
     if (Get-Process -Id $AppPid -ErrorAction SilentlyContinue) { throw 'App did not exit.' }
+    if ($SetupMode) {
+        $setupPath = Join-Path $Stage 'setup.exe'
+        $setup = Start-Process -FilePath $setupPath -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',('/DIR="' + $Install + '"')) -WindowStyle Hidden -Wait -PassThru
+        if ($setup.ExitCode -ne 0) { throw ('Setup exited with code ' + $setup.ExitCode) }
+        Start-Process -FilePath (Join-Path $Install 'BounceMusic.exe') -WorkingDirectory $Install -WindowStyle Normal
+        Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
+        exit 0
+    }
     New-Item -ItemType Directory -Path $backup -ErrorAction Stop | Out-Null
     foreach ($name in $files) {
         $target = Join-Path $Install $name
@@ -38,7 +46,8 @@ try {
         }
     }
     Add-Type -AssemblyName PresentationFramework
-    if ($restoreFailed) { $message = 'The update failed and could not fully restore the previous version. Backup: ' + $backup }
+    if ($SetupMode) { $message = 'The update installer failed. Please download the latest Setup from the release page and try again.' }
+    elseif ($restoreFailed) { $message = 'The update failed and could not fully restore the previous version. Backup: ' + $backup }
     else { $message = 'The update failed. The previous version was restored. Please download the release manually.' }
     [System.Windows.MessageBox]::Show($message, 'BounceMusic Update') | Out-Null
     if (-not $restoreFailed -and (Test-Path -LiteralPath (Join-Path $Install 'BounceMusic.exe'))) {

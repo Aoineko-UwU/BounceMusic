@@ -42,6 +42,11 @@ def test_download_validation():
             except ValueError as error: assert '路径' in str(error)
             else: raise AssertionError('Unsafe archive accepted')
         assert not (Path(directory)/'escape').exists()
+        binary=b'fake installer for testing'; setup=release(binary)
+        setup['assets'][0]['name']='BounceMusic-v1.6.0-Setup-win64.exe'
+        setup['assets'][0]['browser_download_url']='https://github.com/Aoineko-UwU/BounceMusic/releases/download/v1.6.0/BounceMusic-v1.6.0-Setup-win64.exe'
+        with patch.object(updater.tempfile,'tempdir',directory),patch.object(updater.urllib.request,'urlopen',return_value=io.BytesIO(binary)):
+            assert (Path(updater.prepare_update(setup,True))/'setup.exe').read_bytes()==binary
     assert updater.version_tuple('v1.10.0') > updater.version_tuple('1.9.9')
     name='BounceMusic-v1.6.0-win64.zip'; parser=updater.AssetExtractor(name)
     parser.feed('<a href="/Aoineko-UwU/BounceMusic/releases/download/v1.6.0/'+name+'">ZIP</a>'

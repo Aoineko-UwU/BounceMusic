@@ -49,10 +49,15 @@ def release_from_web():
         link=entry.find('a:link',ns)
         if link is not None and link.get('href','').endswith('/'+tag):
             parser=TextExtractor(); parser.feed(entry.findtext('a:content','',ns)); body=parser.text(); break
-    name='BounceMusic-'+tag+'-win64.zip'
     with urllib.request.urlopen(urllib.request.Request(REPO+'/releases/expanded_assets/'+tag,headers=HEADERS),timeout=20) as response:
-        parser=AssetExtractor(name); parser.feed(response.read(2*1024*1024).decode('utf-8'))
-    return {'tag_name':tag,'body':body,'assets':[{'name':name,'browser_download_url':'https://github.com'+(parser.path or ''),'digest':parser.digest,'size':0}]}
+        page=response.read(2*1024*1024).decode('utf-8')
+    assets=[]
+    for suffix in ('-win64.zip','-Setup-win64.exe'):
+        name='BounceMusic-'+tag+suffix
+        parser=AssetExtractor(name); parser.feed(page)
+        if parser.path and parser.digest:
+            assets.append({'name':name,'browser_download_url':'https://github.com'+parser.path,'digest':parser.digest,'size':0})
+    return {'tag_name':tag,'body':body,'assets':assets}
 
 def version_tuple(value):
     match = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', value)
@@ -70,8 +75,8 @@ def latest_release():
     if release.get('draft') or release.get('prerelease'): raise ValueError('此版本不是正式版')
     return release
 
-def release_asset(release):
-    name = 'BounceMusic-' + release['tag_name'] + '-win64.zip'
+def release_asset(release, setup=False):
+    name = 'BounceMusic-' + release['tag_name'] + ('-Setup-win64.exe' if setup else '-win64.zip')
     for asset in release.get('assets', []):
         if asset.get('name') != name: continue
         url=asset.get('browser_download_url','')
@@ -82,15 +87,15 @@ def release_asset(release):
         if not re.fullmatch(r'sha256:[0-9a-fA-F]{64}',digest):
             raise ValueError('更新包没有可验证的 SHA-256 校验值')
         return asset
-    raise ValueError('发布页没有找到 Windows x64 便携包')
+    raise ValueError('发布页没有找到 Windows x64 '+('安装器' if setup else '便携包'))
 
-def prepare_update(release):
-    asset=release_asset(release)
+def prepare_update(release, setup=False):
+    asset=release_asset(release,setup)
     expected_size=int(asset.get('size',0))
     if not 0 <= expected_size <= 500*1024*1024: raise ValueError('更新包大小不正确')
     stage=Path(tempfile.mkdtemp(prefix='BounceMusic-update-'))
     try:
-        archive=stage/'update.zip'; digest=hashlib.sha256(); size=0
+        archive=stage/('setup.exe' if setup else 'update.zip'); digest=hashlib.sha256(); size=0
         request=urllib.request.Request(asset['browser_download_url'],headers=HEADERS)
         with urllib.request.urlopen(request,timeout=60) as response, archive.open('wb') as output:
             while True:
@@ -101,6 +106,7 @@ def prepare_update(release):
                 digest.update(block); output.write(block)
         if not size or (expected_size and size != expected_size) or digest.hexdigest().lower() != asset['digest'][7:].lower():
             raise ValueError('更新包校验失败')
+        if setup: return str(stage)
         extracted=stage/'files'; extracted.mkdir()
         with zipfile.ZipFile(archive) as package:
             total=0
@@ -120,12 +126,14 @@ def prepare_update(release):
         shutil.rmtree(stage,ignore_errors=True)
         raise
 
-def launch_updater(stage, install_dir, pid):
+def launch_updater(stage, install_dir, pid, setup=False):
     if not getattr(sys,'frozen',False): raise RuntimeError('源码运行模式请从发布页下载更新')
     helper=Path(sys._MEIPASS)/'updater.ps1'
     if not helper.is_file(): raise FileNotFoundError('更新组件不存在')
     # Copy out of the installation tree before it is replaced.
     script=Path(stage)/'updater.ps1'; shutil.copy2(helper,script)
-    subprocess.Popen(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
-                      '-File',str(script),'-Stage',stage,'-Install',install_dir,'-AppPid',str(pid)],
+    args=['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+                      '-File',str(script),'-Stage',stage,'-Install',install_dir,'-AppPid',str(pid)]
+    if setup: args.append('-SetupMode')
+    subprocess.Popen(args,
                      creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),close_fds=True)

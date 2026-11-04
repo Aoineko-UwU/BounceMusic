@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from app import BeatTracker, learned_octave_bias, process_capture_supported
+from app import BeatTracker, learned_octave_bias, process_capture_supported, local_half_tempo_preference
 
 RATE = 48_000
 CHUNK = 1024
@@ -115,6 +115,31 @@ def test_tempo_changes_are_corrected_gradually():
     assert tracker.correction_interval('low') > tracker.correction_interval('medium') > tracker.correction_interval('high')
     assert tracker.correction_interval('low',True) > tracker.correction_interval('high',True)
 
+def test_subdivision_does_not_double_slow_songs_or_halve_fast_songs():
+    for tempo in (60,80,90,120,160,180):
+        signal=np.zeros(RATE*27,dtype=np.float32)
+        t=np.arange(2600); click=np.sin(2*np.pi*95*t/RATE)*np.exp(-t/400)
+        for beat in np.arange(.5,25,60/tempo):
+            i=round(beat*RATE); j=round((beat+30/tempo)*RATE)
+            signal[i:i+len(t)]+=.8*click; signal[j:j+len(t)]+=.4*click
+        tracker=BeatTracker()
+        for i in range(0,len(signal)-CHUNK,CHUNK): tracker.feed(signal[i:i+CHUNK],i/RATE)
+        assert abs(tracker.bpm-tempo) < tempo*.08, (tempo,tracker.bpm)
+
+def test_personalized_octave_evidence_is_local_and_bounded():
+    examples=[{'estimated':160,'actual':80}]*3
+    assert local_half_tempo_preference(examples,160)
+    assert not local_half_tempo_preference(examples,100)
+    assert not local_half_tempo_preference(examples[:1],160)
+    assert not local_half_tempo_preference(examples+[{'estimated':160,'actual':160}]*8,160)
+
+def test_media_pause_clock_shifts_phase_without_changing_tempo():
+    tracker=BeatTracker(); tracker.bpm=120; tracker.phase=10.; tracker.last_signal=10.5
+    tracker.onsets.append((10.25,1.))
+    tracker.shift_clock(5.)
+    assert tracker.bpm==120 and tracker.phase==15. and tracker.last_signal==15.5
+    assert tracker.onsets[0][0]==15.25
+
 if __name__ == '__main__':
     test_fixed_grid()
     test_distinct_songs_keep_independent_tempo()
@@ -125,4 +150,7 @@ if __name__ == '__main__':
     test_manual_lock_still_corrects_phase()
     test_windows_capture_capability()
     test_tempo_changes_are_corrected_gradually()
+    test_subdivision_does_not_double_slow_songs_or_halve_fast_songs()
+    test_personalized_octave_evidence_is_local_and_bounded()
+    test_media_pause_clock_shifts_phase_without_changing_tempo()
     print('Rhythm checks passed.')
