@@ -106,6 +106,15 @@ def test_windows_capture_capability():
     assert not process_capture_supported(19045)
     assert process_capture_supported(22000)
 
+def test_tempo_changes_are_corrected_gradually():
+    signal=np.concatenate((render(duration=28,bpm=120),render(duration=40,bpm=140)))
+    tracker=BeatTracker(bpm_correction='high',phase_correction='high')
+    for i in range(0,len(signal)-CHUNK,CHUNK):
+        tracker.feed(signal[i:i+CHUNK],i/RATE)
+    assert 128 < tracker.bpm < 145, tracker.bpm
+    assert tracker.correction_interval('low') > tracker.correction_interval('medium') > tracker.correction_interval('high')
+    assert tracker.correction_interval('low',True) > tracker.correction_interval('high',True)
+
 if __name__ == '__main__':
     test_fixed_grid()
     test_distinct_songs_keep_independent_tempo()
@@ -115,4 +124,5 @@ if __name__ == '__main__':
     test_manual_lock_keeps_current_song_tempo()
     test_manual_lock_still_corrects_phase()
     test_windows_capture_capability()
+    test_tempo_changes_are_corrected_gradually()
     print('Rhythm checks passed.')
