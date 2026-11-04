@@ -78,6 +78,28 @@ def test_window_and_image_flow():
                 application.show_settings()
                 application.settings_window.update()
                 near_center(application.settings_window)
+                before = set(application.root.winfo_children())
+                application.show_update({'tag_name':'v9.9.9', 'body':'## 本版本更新\n\n- 改进 **节奏** 和 `BPM`\n\n[查看发布页](https://github.com/Aoineko-UwU/BounceMusic/releases)'})
+                application.root.update()
+                dialog = next(child for child in application.root.winfo_children() if child not in before)
+                near_center(dialog)
+                assert dialog.resizable() == (0, 0)
+                content = next(child for child in dialog.winfo_children() if isinstance(child, module.ttk.Frame) and any(isinstance(item, module.tk.Text) for item in child.winfo_children()))
+                notes = next(child for child in content.winfo_children() if isinstance(child, module.tk.Text))
+                assert any(isinstance(child, module.ttk.Scrollbar) for child in content.winfo_children())
+                rendered = notes.get('1.0','end')
+                assert '##' not in rendered and '**' not in rendered and '`' not in rendered
+                assert '本版本更新' in rendered and '•  改进 节奏 和 BPM' in rendered and '查看发布页' in rendered
+                assert notes.tag_ranges('heading') and notes.tag_ranges('bullet') and notes.tag_ranges('link')
+                dialog.destroy()
+                application.show_update_progress(); application.root.update()
+                near_center(application.update_progress_window)
+                application.update_download_progress('download',512,1024)
+                assert '50%' in application.update_progress_text.get()
+                assert str(application.update_progress_bar.cget('mode')) == 'determinate'
+                application.update_download_progress('verify',1024,1024)
+                assert '校验' in application.update_progress_text.get()
+                application.close_update_progress()
                 assert [application.settings_notebook.tab(tab,'text') for tab in application.settings_notebook.tabs()] == ['常规','功能','关于']
                 assert application.flash_enabled.get() and application.notice_enabled.get()
                 assert application.flash_color == '#ffff00' and application.notice_color == '#ffff00'

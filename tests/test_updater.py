@@ -25,12 +25,18 @@ def test_download_validation():
     data=package({'BounceMusic.exe':b'program','_internal/data':b'data'})
     with tempfile.TemporaryDirectory() as directory:
         with patch.object(updater.tempfile,'tempdir',directory),patch.object(updater.urllib.request,'urlopen',return_value=io.BytesIO(data)):
-            stage=Path(updater.prepare_update(release(data)))
+            progress=[]
+            stage=Path(updater.prepare_update(release(data),progress=lambda *event:progress.append(event)))
             assert (stage/'files'/'BounceMusic.exe').read_bytes()==b'program'
             assert (stage/'files'/'_internal'/'data').read_bytes()==b'data'
+            assert progress[0] == ('download',0,len(data))
+            assert ('download',len(data),len(data)) in progress
+            assert [event[0] for event in progress[-2:]] == ['verify','extract']
         no_size=release(data); no_size['assets'][0]['size']=0
         with patch.object(updater.tempfile,'tempdir',directory),patch.object(updater.urllib.request,'urlopen',return_value=io.BytesIO(data)):
-            assert (Path(updater.prepare_update(no_size))/'files'/'BounceMusic.exe').is_file()
+            progress=[]
+            assert (Path(updater.prepare_update(no_size,progress=lambda *event:progress.append(event)))/'files'/'BounceMusic.exe').is_file()
+            assert progress[0] == ('download',0,0)
         bad=release(data); bad['assets'][0]['digest']='sha256:'+'0'*64
         with patch.object(updater.tempfile,'tempdir',directory),patch.object(updater.urllib.request,'urlopen',return_value=io.BytesIO(data)):
             try: updater.prepare_update(bad)

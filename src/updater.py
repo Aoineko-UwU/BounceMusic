@@ -89,7 +89,7 @@ def release_asset(release, setup=False):
         return asset
     raise ValueError('发布页没有找到 Windows x64 '+('安装器' if setup else '便携包'))
 
-def prepare_update(release, setup=False):
+def prepare_update(release, setup=False, progress=None):
     asset=release_asset(release,setup)
     expected_size=int(asset.get('size',0))
     if not 0 <= expected_size <= 500*1024*1024: raise ValueError('更新包大小不正确')
@@ -98,15 +98,24 @@ def prepare_update(release, setup=False):
         archive=stage/('setup.exe' if setup else 'update.zip'); digest=hashlib.sha256(); size=0
         request=urllib.request.Request(asset['browser_download_url'],headers=HEADERS)
         with urllib.request.urlopen(request,timeout=60) as response, archive.open('wb') as output:
+            total=expected_size
+            if not total:
+                try: total=int(response.headers.get('Content-Length',0))
+                except (AttributeError,TypeError,ValueError): total=0
+                if not 0 < total <= 500*1024*1024: total=0
+            if progress: progress('download',0,total)
             while True:
                 block=response.read(1024*1024)
                 if not block: break
                 size+=len(block)
                 if size>(expected_size or 500*1024*1024): raise ValueError('更新包大小超过预期')
                 digest.update(block); output.write(block)
+                if progress: progress('download',size,total)
+        if progress: progress('verify',size,total)
         if not size or (expected_size and size != expected_size) or digest.hexdigest().lower() != asset['digest'][7:].lower():
             raise ValueError('更新包校验失败')
         if setup: return str(stage)
+        if progress: progress('extract',size,total)
         extracted=stage/'files'; extracted.mkdir()
         with zipfile.ZipFile(archive) as package:
             total=0

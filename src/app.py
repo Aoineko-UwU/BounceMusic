@@ -23,7 +23,7 @@ ASSET_BASE = getattr(sys, '_MEIPASS', os.path.dirname(os.path.dirname(os.path.ab
 LOADING_GIF = os.path.join(ASSET_BASE, 'assets', 'Loading.gif')
 APP_ICON = os.path.join(ASSET_BASE, 'assets', 'icon.ico')
 MATOU_IMAGE = os.path.join(ASSET_BASE, 'assets', 'matou.png')
-VERSION = '1.6.0'
+VERSION = '1.6.1'
 AUTHOR = '葵猫猫'
 
 def acquire_single_instance():
@@ -45,6 +45,37 @@ def center_window(window, width=None, height=None):
     x = max(0, (window.winfo_screenwidth()-width)//2)
     y = max(0, (window.winfo_screenheight()-height)//2)
     window.geometry(f'{width}x{height}+{x}+{y}')
+
+def render_release_notes(widget, body):
+    """Render the common release-note Markdown without executing embedded content."""
+    widget.tag_configure('heading', font=('Microsoft YaHei UI', 11, 'bold'), spacing1=10, spacing3=5)
+    widget.tag_configure('bullet', lmargin1=12, lmargin2=30, spacing3=5)
+    widget.tag_configure('paragraph', spacing3=5)
+    widget.tag_configure('bold', font=('Microsoft YaHei UI', 10, 'bold'))
+    widget.tag_configure('link', foreground='#1681d4', underline=True)
+    inline = re.compile(r'\[([^\]]+)\]\((https?://[^\s)]+)\)|\*\*([^*]+)\*\*|`([^`]+)`')
+    def insert_inline(line):
+        position=0
+        for match in inline.finditer(line):
+            widget.insert('end',line[position:match.start()])
+            if match.group(1):
+                tag='release_link_'+str(match.start())+'_'+str(widget.index('end-1c')).replace('.','_')
+                widget.insert('end',match.group(1),('link',tag))
+                url=match.group(2)
+                widget.tag_bind(tag,'<Button-1>',lambda event, target=url:webbrowser.open(target))
+            else: widget.insert('end',match.group(3) or match.group(4),'bold')
+            position=match.end()
+        widget.insert('end',line[position:])
+    for line in (body or '该版本未提供更新说明。').splitlines():
+        heading=re.match(r'^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$',line)
+        bullet=re.match(r'^\s*[-*+]\s+(.+)$',line)
+        start=widget.index('end-1c')
+        if heading: insert_inline(heading.group(1)); tag='heading'
+        elif bullet: widget.insert('end','•  '); insert_inline(bullet.group(1)); tag='bullet'
+        else: insert_inline(line); tag='paragraph'
+        widget.insert('end','\n')
+        widget.tag_add(tag,start,'end-1c')
+    widget.config(state='disabled')
 
 def amplitude_from_config(config):
     if 'amplitude' not in config: return 100.
@@ -661,7 +692,7 @@ class App:
         self.tick_job = None
         self.flash_started = -1e9
         self.bpm_notice_started = -1e9; self.bpm_notice_value = 0
-        self.update_busy = False; self.update_release = None
+        self.update_busy = False; self.update_release = None; self.update_progress_window = None
         self.setup_install = os.path.isfile(os.path.join(BASE,'.bounce-installed'))
         self.shared_image_path = self.config.get('image','')
         self.shared_original = self.get_image(self.shared_image_path)
@@ -1325,27 +1356,61 @@ class App:
             try: self.events.put(('update_checked',updater.latest_release()))
             except Exception as error: self.events.put(('update_error',str(error)))
         threading.Thread(target=worker,daemon=True).start()
+    def show_update_progress(self):
+        window=tk.Toplevel(self.root); window.withdraw(); self.update_progress_window=window
+        set_window_icon(window); window.title('正在更新'); window.resizable(False,False)
+        self.update_progress_text=tk.StringVar(value='正在连接下载服务器……')
+        ttk.Label(window,text='正在准备更新',font=('Microsoft YaHei UI',12,'bold')).pack(anchor='w',padx=18,pady=(16,8))
+        ttk.Label(window,textvariable=self.update_progress_text).pack(anchor='w',padx=18)
+        self.update_progress_bar=ttk.Progressbar(window,mode='indeterminate')
+        self.update_progress_bar.pack(fill='x',padx=18,pady=(12,16)); self.update_progress_bar.start(12)
+        window.protocol('WM_DELETE_WINDOW',window.withdraw)
+        self.apply_theme(); center_window(window,460,150); window.deiconify(); window.attributes('-topmost',True); window.lift()
+        window.after_idle(lambda: center_window(window,460,150) if window.winfo_exists() else None)
+    def update_download_progress(self, phase, size, total):
+        window=self.update_progress_window
+        if not window or not window.winfo_exists(): return
+        bar=self.update_progress_bar
+        if phase=='download':
+            if total:
+                bar.stop(); bar.configure(mode='determinate',maximum=total,value=min(size,total))
+                message=f'正在下载：{size/1048576:.1f} / {total/1048576:.1f} MB（{min(100,size*100/total):.0f}%）'
+            else:
+                if str(bar.cget('mode'))!='indeterminate': bar.configure(mode='indeterminate'); bar.start(12)
+                message=f'正在下载：{size/1048576:.1f} MB'
+        else:
+            bar.stop(); bar.configure(mode='indeterminate'); bar.start(12)
+            message='正在校验更新包……' if phase=='verify' else '正在解压更新包……'
+        self.update_progress_text.set(message); self.update_status.set(message)
+    def close_update_progress(self):
+        window=self.update_progress_window; self.update_progress_window=None
+        if window and window.winfo_exists(): window.destroy()
     def show_update(self,release):
-        dialog=tk.Toplevel(self.root); set_window_icon(dialog); dialog.title('发现新版本'); dialog.resizable(True,True)
+        dialog=tk.Toplevel(self.root); dialog.withdraw(); set_window_icon(dialog); dialog.title('发现新版本'); dialog.resizable(False,False)
         ttk.Label(dialog,text='发现新版本 '+release['tag_name'],font=('Microsoft YaHei UI',13,'bold'),padding=12).pack(anchor='w')
         ttk.Label(dialog,text='更新内容：').pack(anchor='w',padx=12)
-        notes=tk.Text(dialog,width=65,height=15,wrap='word')
-        notes.insert('1.0',release.get('body') or '该版本未提供更新说明。'); notes.config(state='disabled')
-        notes.pack(fill='both',expand=True,padx=12,pady=8)
+        content=ttk.Frame(dialog); content.pack(fill='both',expand=True,padx=12,pady=8)
+        notes=tk.Text(content,wrap='word',font=('Microsoft YaHei UI',10),padx=12,pady=8,relief='flat',cursor='arrow')
+        scrollbar=ttk.Scrollbar(content,orient='vertical',command=notes.yview)
+        notes.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side='right',fill='y'); notes.pack(side='left',fill='both',expand=True)
+        render_release_notes(notes,release.get('body'))
         row=ttk.Frame(dialog,padding=12); row.pack(fill='x')
         def accept():
             dialog.destroy()
             if not getattr(sys,'frozen',False):
                 self.update_status.set('源码运行模式请从发布页下载便携包。'); return
             self.update_busy=True; self.update_status.set('正在下载并校验更新，请稍候……')
+            self.show_update_progress()
             def worker():
-                try: self.events.put(('update_ready',updater.prepare_update(release,self.setup_install)))
+                try: self.events.put(('update_ready',updater.prepare_update(release,self.setup_install,lambda *progress:self.events.put(('update_progress',progress)))))
                 except Exception as error: self.events.put(('update_error',str(error)))
             threading.Thread(target=worker,daemon=True).start()
         ttk.Button(row,text='更新并重启',command=accept).pack(side='left')
         ttk.Button(row,text='暂不更新',command=dialog.destroy).pack(side='right')
         self.apply_theme()
-        center_window(dialog); dialog.attributes('-topmost',True); dialog.lift()
+        center_window(dialog,600,520); dialog.deiconify(); dialog.attributes('-topmost',True); dialog.lift()
+        dialog.after_idle(lambda: center_window(dialog,600,520) if dialog.winfo_exists() else None)
 
     def find_playing_process(self):
         if not process_capture_supported():
@@ -1540,9 +1605,11 @@ class App:
                         else: self.update_status.set('当前已是最新版本。')
                     except Exception as error: self.update_status.set('检查更新失败：'+str(error))
                 elif kind=='update_error':
-                    self.update_busy=False; self.update_status.set('更新失败：'+str(value))
+                    self.close_update_progress(); self.update_busy=False; self.update_status.set('更新失败：'+str(value))
+                    messagebox.showerror('更新失败',str(value),parent=self.root)
+                elif kind=='update_progress': self.update_download_progress(*value)
                 elif kind=='update_ready':
-                    self.update_busy=False
+                    self.close_update_progress(); self.update_busy=False
                     try:
                         self.save(); updater.launch_updater(value,BASE,os.getpid(),self.setup_install); self.quit(); return
                     except Exception as error: self.update_status.set('无法启动更新：'+str(error))
