@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.request
 import urllib.error
 import zipfile
@@ -18,6 +19,23 @@ from urllib.parse import urlparse
 API = 'https://api.github.com/repos/Aoineko-UwU/BounceMusic/releases/latest'
 HEADERS = {'User-Agent': 'BounceMusic-Updater', 'Accept': 'application/vnd.github+json'}
 REPO = 'https://github.com/Aoineko-UwU/BounceMusic'
+MIRROR = 'https://ghfast.top/'
+
+class UpdateCancelled(Exception): pass
+
+class DownloadControl:
+    def __init__(self):
+        self.condition=threading.Condition(); self.paused=False; self.cancelled=False
+    def pause(self, paused):
+        with self.condition:
+            self.paused=paused; self.condition.notify_all()
+    def cancel(self):
+        with self.condition:
+            self.cancelled=True; self.condition.notify_all()
+    def checkpoint(self):
+        with self.condition:
+            while self.paused and not self.cancelled: self.condition.wait(.2)
+            if self.cancelled: raise UpdateCancelled('已取消更新下载')
 
 class TextExtractor(html.parser.HTMLParser):
     def __init__(self):
@@ -89,37 +107,50 @@ def release_asset(release, setup=False):
         return asset
     raise ValueError('发布页没有找到 Windows x64 '+('安装器' if setup else '便携包'))
 
-def prepare_update(release, setup=False, progress=None):
+def prepare_update(release, setup=False, progress=None, control=None):
     asset=release_asset(release,setup)
     expected_size=int(asset.get('size',0))
     if not 0 <= expected_size <= 500*1024*1024: raise ValueError('更新包大小不正确')
     stage=Path(tempfile.mkdtemp(prefix='BounceMusic-update-'))
     try:
-        archive=stage/('setup.exe' if setup else 'update.zip'); digest=hashlib.sha256(); size=0
-        request=urllib.request.Request(asset['browser_download_url'],headers=HEADERS)
-        with urllib.request.urlopen(request,timeout=60) as response, archive.open('wb') as output:
-            total=expected_size
-            if not total:
-                try: total=int(response.headers.get('Content-Length',0))
-                except (AttributeError,TypeError,ValueError): total=0
-                if not 0 < total <= 500*1024*1024: total=0
-            if progress: progress('download',0,total)
-            while True:
-                block=response.read(1024*1024)
-                if not block: break
-                size+=len(block)
-                if size>(expected_size or 500*1024*1024): raise ValueError('更新包大小超过预期')
-                digest.update(block); output.write(block)
-                if progress: progress('download',size,total)
-        if progress: progress('verify',size,total)
-        if not size or (expected_size and size != expected_size) or digest.hexdigest().lower() != asset['digest'][7:].lower():
-            raise ValueError('更新包校验失败')
+        archive=stage/('setup.exe' if setup else 'update.zip')
+        for attempt,url in enumerate((MIRROR+asset['browser_download_url'],asset['browser_download_url'])):
+            if control: control.checkpoint()
+            digest=hashlib.sha256(); size=0; total=expected_size
+            try:
+                if progress: progress('mirror' if attempt==0 else 'direct',0,total)
+                request=urllib.request.Request(url,headers=HEADERS)
+                with urllib.request.urlopen(request,timeout=15) as response, archive.open('wb') as output:
+                    if not total:
+                        try: total=int(response.headers.get('Content-Length',0))
+                        except (AttributeError,TypeError,ValueError): total=0
+                        if not 0 < total <= 500*1024*1024: total=0
+                    if progress: progress('download',0,total)
+                    while True:
+                        if control: control.checkpoint()
+                        block=response.read(65536)
+                        if control: control.checkpoint()
+                        if not block: break
+                        size+=len(block)
+                        if size>(expected_size or 500*1024*1024): raise ValueError('更新包大小超过预期')
+                        digest.update(block); output.write(block)
+                        if progress: progress('download',size,total)
+                if control: control.checkpoint()
+                if progress: progress('verify',size,total)
+                if not size or (expected_size and size != expected_size) or digest.hexdigest().lower() != asset['digest'][7:].lower():
+                    raise ValueError('更新包校验失败')
+                if control: control.checkpoint()
+                break
+            except UpdateCancelled: raise
+            except (OSError,ValueError,urllib.error.URLError):
+                if attempt: raise
         if setup: return str(stage)
         if progress: progress('extract',size,total)
         extracted=stage/'files'; extracted.mkdir()
         with zipfile.ZipFile(archive) as package:
             total=0
             for item in package.infolist():
+                if control: control.checkpoint()
                 name=item.filename.replace('\\','/')
                 path=PurePosixPath(name)
                 if path.is_absolute() or '..' in path.parts or ':' in name or not path.parts:
@@ -127,6 +158,7 @@ def prepare_update(release, setup=False, progress=None):
                 total+=item.file_size
                 if total>1024*1024*1024: raise ValueError('解压后的更新包过大')
             package.extractall(extracted)
+        if control: control.checkpoint()
         if not (extracted/'BounceMusic.exe').is_file() or not (extracted/'_internal').is_dir():
             raise ValueError('更新包缺少程序文件')
         archive.unlink()

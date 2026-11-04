@@ -1,4 +1,4 @@
-import os, sys, time, threading, queue, json, math, traceback, shutil, filecmp
+import os, sys, time, threading, queue, json, math, traceback, shutil, filecmp, io
 import ctypes, webbrowser
 import re
 from collections import deque, OrderedDict
@@ -23,7 +23,7 @@ ASSET_BASE = getattr(sys, '_MEIPASS', os.path.dirname(os.path.dirname(os.path.ab
 LOADING_GIF = os.path.join(ASSET_BASE, 'assets', 'Loading.gif')
 APP_ICON = os.path.join(ASSET_BASE, 'assets', 'icon.ico')
 MATOU_IMAGE = os.path.join(ASSET_BASE, 'assets', 'matou.png')
-VERSION = '1.6.2'
+VERSION = '1.6.3'
 AUTHOR = '葵猫猫'
 
 def acquire_single_instance():
@@ -56,22 +56,49 @@ def image_file(path):
         return os.path.join(library_dir(),name) if name and os.path.basename(name)==name else ''
     return path
 
+def square_image(image):
+    side=min(image.size); left=(image.width-side)//2; top=(image.height-side)//2
+    return image.crop((left,top,left+side,top+side))
+
 def store_image(path):
-    with Image.open(path) as image: image.verify()
+    with Image.open(path) as image:
+        image.verify()
+    cropped=None
+    with Image.open(path) as image:
+        if image.width != image.height:
+            frames=[]; durations=[]
+            for frame in ImageSequence.Iterator(image):
+                frame=ImageOps.exif_transpose(frame).convert('RGBA')
+                frames.append(square_image(frame))
+                durations.append(frame.info.get('duration',image.info.get('duration',100)))
+            output=io.BytesIO()
+            if len(frames)>1:
+                frames[0].save(output,format='GIF',save_all=True,append_images=frames[1:],duration=durations,loop=image.info.get('loop',0),disposal=2)
+                extension='.gif'
+            else:
+                frames[0].save(output,format='PNG'); extension='.png'
+            cropped=output.getvalue()
     os.makedirs(library_dir(),exist_ok=True)
-    name=os.path.basename(path); stem,extension=os.path.splitext(name)
+    name=os.path.basename(path); stem,original_extension=os.path.splitext(name)
+    if cropped is None: extension=original_extension
+    else: name=stem+extension
     candidate=os.path.join(library_dir(),name); index=2
     while os.path.exists(candidate):
-        if os.path.samefile(path,candidate) or filecmp.cmp(path,candidate,shallow=False):
+        if cropped is not None:
+            with open(candidate,'rb') as existing: same=existing.read()==cropped
+        else: same=os.path.samefile(path,candidate) or filecmp.cmp(path,candidate,shallow=False)
+        if same:
             return 'stored:'+os.path.basename(candidate)
         candidate=os.path.join(library_dir(),f'{stem} ({index}){extension}'); index+=1
-    shutil.copy2(path,candidate)
+    if cropped is None: shutil.copy2(path,candidate)
+    else:
+        with open(candidate,'xb') as output: output.write(cropped)
     return 'stored:'+os.path.basename(candidate)
 
 def render_release_notes(widget, body):
     """Render the common release-note Markdown without executing embedded content."""
     widget.tag_configure('heading', font=('Microsoft YaHei UI', 11, 'bold'), spacing1=10, spacing3=5)
-    widget.tag_configure('bullet', lmargin1=12, lmargin2=30, spacing3=5)
+    widget.tag_configure('bullet', spacing3=5)
     widget.tag_configure('paragraph', spacing3=5)
     widget.tag_configure('bold', font=('Microsoft YaHei UI', 10, 'bold'))
     widget.tag_configure('link', foreground='#1681d4', underline=True)
@@ -88,15 +115,18 @@ def render_release_notes(widget, body):
             else: widget.insert('end',match.group(3) or match.group(4),'bold')
             position=match.end()
         widget.insert('end',line[position:])
-    for line in (body or '该版本未提供更新说明。').splitlines():
+    lines=(body or '该版本未提供更新说明。').splitlines()
+    for index,line in enumerate(lines):
         heading=re.match(r'^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$',line)
+        if heading and index and re.search(r'下载|安装|运行|download|install',heading.group(1),re.I): break
+        if index and re.fullmatch(r'\s*(下载与运行|下载和运行|下载|安装|Download|Installation)\s*',line,re.I): break
         bullet=re.match(r'^\s*[-*+]\s+(.+)$',line)
         start=widget.index('end-1c')
         if heading: insert_inline(heading.group(1)); tag='heading'
         elif bullet: widget.insert('end','•  '); insert_inline(bullet.group(1)); tag='bullet'
         else: insert_inline(line); tag='paragraph'
-        widget.insert('end','\n')
         widget.tag_add(tag,start,'end-1c')
+        widget.insert('end','\n',())
     widget.config(state='disabled')
 
 def amplitude_from_config(config):
@@ -246,9 +276,19 @@ class BeatTracker:
             if self.bpm and self.phase:
                 period = 60/self.bpm
                 error = (onset_time-self.phase+period/2) % period-period/2
-                if abs(error) < min(.09, period*.18) and strength > .35 and now-self.last_phase_adjust >= self.correction_interval(self.phase_correction,True):
-                    self.phase += error*.12
-                    self.last_phase_adjust=now
+                if now-self.last_phase_adjust >= self.correction_interval(self.phase_correction,True):
+                    recent=[(t,s) for t,s in self.onsets if now-t < 6 and s>.35]
+                    if len(recent)>=4:
+                        weights=np.array([min(3.,s) for _,s in recent])
+                        angles=np.array([2*math.pi*(t-self.phase)/period for t,_ in recent])
+                        vector=np.sum(weights*np.exp(1j*angles))
+                        if abs(vector) >= .42*weights.sum():
+                            drift=float(np.angle(vector))*period/(2*math.pi)
+                            self.phase += float(np.clip(drift*.45,-.04,.04))
+                            self.last_phase_adjust=now
+                    elif abs(error) < min(.09, period*.18) and strength > .35:
+                        self.phase += error*.12
+                        self.last_phase_adjust=now
         check_tempo = (not self.bpm and self.steps % max(1, int(1.5*self.rate/self.chunk)) == 0 or
                        self.bpm and not self.manual_bpm and now-self.last_tempo_check >= self.correction_interval(self.bpm_correction))
         if check_tempo and len(self.flux)>6*self.rate/self.chunk:
@@ -466,6 +506,8 @@ class Analyzer:
                     if self.manual_bpm and tracker.manual_bpm != self.manual_bpm:
                         tracker.manual_bpm=self.manual_bpm; tracker.bpm=self.manual_bpm
                         tracker.align_phase(now); tracker.last_grid=None; tracker.tempo_candidates.clear()
+                    elif not self.manual_bpm and tracker.manual_bpm:
+                        tracker.manual_bpm=0.; tracker.tempo_candidates.clear(); tracker.last_tempo_check=0.
                     if tracker.last_signal and now-tracker.last_signal < .25:
                         self.last_audible=time.monotonic()
                     old_bpm=tracker.bpm
@@ -733,7 +775,7 @@ class App:
         self.tick_job = None
         self.flash_started = -1e9
         self.bpm_notice_started = -1e9; self.bpm_notice_value = 0
-        self.update_busy = False; self.update_release = None; self.update_progress_window = None
+        self.update_busy = False; self.update_release = None; self.update_progress_window = None; self.update_control = None
         self.setup_install = os.path.isfile(os.path.join(BASE,'.bounce-installed'))
         self.shared_image_path = self.config.get('image','')
         self.shared_original = self.get_image(self.shared_image_path)
@@ -936,6 +978,8 @@ class App:
         ttk.Button(row,text='立即对齐节奏',command=self.realign_rhythm).pack(side='left',padx=5)
         ttk.Label(row,textvariable=self.bpmtext,font=('Microsoft YaHei UI',11,'bold')).pack(side='right')
         row=ttk.Frame(main); row.pack(fill='x',pady=(0,4))
+        self.manual_unlock_button=ttk.Button(row,text='解锁',command=self.unlock_manual_bpm)
+        self.manual_unlock_button.pack(side='right',padx=(5,0)); self.manual_unlock_button.state(['disabled'])
         self.manual_learn_button=ttk.Button(row,text='应用并学习',command=lambda:self.apply_manual_bpm(True))
         self.manual_learn_button.pack(side='right')
         self.manual_lock_button=ttk.Button(row,text='仅应用',command=lambda:self.apply_manual_bpm(False))
@@ -1113,7 +1157,8 @@ class App:
             if not hasattr(self,'default_image'): self.default_image=slime()
             return self.default_image
         if path not in self.image_cache:
-            self.image_cache[path]=SpriteWindow.load_image(image_file(path))
+            image=SpriteWindow.load_image(image_file(path))
+            self.image_cache[path]=square_image(image) if path.startswith('stored:') else image
         return self.image_cache[path]
     def image_name(self,path):
         return '默认图片' if not path else ('玛头' if path=='preset:matou' else os.path.basename(image_file(path)))
@@ -1224,6 +1269,7 @@ class App:
                 else:
                     with Image.open(image_file(path)) as opened:
                         opened.seek(0); opened.draft('RGB',(72,72)); image=ImageOps.exif_transpose(opened).convert('RGBA')
+                    if path.startswith('stored:'): image=square_image(image)
                 image.thumbnail((58,58),Image.Resampling.LANCZOS)
                 self.picker_thumbnails[path]=ImageTk.PhotoImage(image)
             except Exception: self.picker_thumbnails[path]=ImageTk.PhotoImage(slime().resize((58,52)))
@@ -1359,7 +1405,11 @@ class App:
         self.manual_learn_button.state(['!disabled'])
         self.manual_lock_button.config(text='仅应用')
         self.manual_learn_button.config(text='应用并学习')
+        self.manual_unlock_button.state(['disabled'])
         if self.analyzer: self.analyzer.manual_bpm=0.
+    def unlock_manual_bpm(self):
+        self.clear_manual_bpm()
+        self.status.set('已解锁手动 BPM，可重新输入或等待自动分析。')
     def record_bpm_example(self,estimated,truth,source):
         examples=self.config.setdefault('bpm_examples',[])
         examples.append({'estimated':round(estimated,2),'actual':round(truth,2),'source':source})
@@ -1385,6 +1435,7 @@ class App:
         self.manual_lock_button.config(text='已锁定')
         self.manual_lock_button.state(['disabled'])
         self.manual_learn_button.state(['disabled'])
+        self.manual_unlock_button.state(['!disabled'])
         self.status.set(f'本首歌曲已按 {truth:g} BPM 锁定，'+('已记录学习样本。' if learn else '未记录学习样本。'))
         self.save()
     def clear_analysis_data(self):
@@ -1423,14 +1474,29 @@ class App:
         ttk.Label(window,text='正在准备更新',font=('Microsoft YaHei UI',12,'bold')).pack(anchor='w',padx=18,pady=(16,8))
         ttk.Label(window,textvariable=self.update_progress_text).pack(anchor='w',padx=18)
         self.update_progress_bar=ttk.Progressbar(window,mode='indeterminate')
-        self.update_progress_bar.pack(fill='x',padx=18,pady=(12,16)); self.update_progress_bar.start(12)
-        window.protocol('WM_DELETE_WINDOW',window.withdraw)
-        self.apply_theme(); center_window(window,460,150); window.deiconify(); window.attributes('-topmost',True); window.lift()
+        self.update_progress_bar.pack(fill='x',padx=18,pady=(12,8)); self.update_progress_bar.start(12)
+        if self.update_control is None: self.update_control=updater.DownloadControl()
+        row=ttk.Frame(window); row.pack(fill='x',padx=18,pady=(0,12))
+        def toggle_pause():
+            paused=not self.update_control.paused; self.update_control.pause(paused)
+            self.update_pause_button.config(text='继续下载' if paused else '暂停下载')
+            if paused: self.update_progress_text.set('已暂停下载')
+        def cancel():
+            self.update_control.cancel(); self.update_progress_text.set('正在取消并清理下载……')
+            self.update_pause_button.state(['disabled']); self.update_cancel_button.state(['disabled'])
+        self.update_pause_button=ttk.Button(row,text='暂停下载',command=toggle_pause); self.update_pause_button.pack(side='left')
+        self.update_cancel_button=ttk.Button(row,text='中断下载',command=cancel); self.update_cancel_button.pack(side='right')
+        window.protocol('WM_DELETE_WINDOW',lambda: None)
+        self.apply_theme(); center_window(window,460,195); window.deiconify(); window.attributes('-topmost',True); window.lift()
     def update_download_progress(self, phase, size, total):
         window=self.update_progress_window
         if not window or not window.winfo_exists(): return
+        if self.update_control and (self.update_control.cancelled or self.update_control.paused): return
         bar=self.update_progress_bar
-        if phase=='download':
+        if phase in ('mirror','direct'):
+            self.update_pause_button.state(['!disabled']); self.update_cancel_button.state(['!disabled'])
+            message='正在连接加速节点……' if phase=='mirror' else '加速节点不可用，正在连接 GitHub……'
+        elif phase=='download':
             if total:
                 bar.stop(); bar.configure(mode='determinate',maximum=total,value=min(size,total))
                 message=f'正在下载：{size/1048576:.1f} / {total/1048576:.1f} MB（{min(100,size*100/total):.0f}%）'
@@ -1438,37 +1504,39 @@ class App:
                 if str(bar.cget('mode'))!='indeterminate': bar.configure(mode='indeterminate'); bar.start(12)
                 message=f'正在下载：{size/1048576:.1f} MB'
         else:
+            self.update_pause_button.state(['disabled']); self.update_cancel_button.state(['disabled'])
             bar.stop(); bar.configure(mode='indeterminate'); bar.start(12)
             message='正在校验更新包……' if phase=='verify' else '正在解压更新包……'
         self.update_progress_text.set(message); self.update_status.set(message)
     def close_update_progress(self):
-        window=self.update_progress_window; self.update_progress_window=None
+        window=self.update_progress_window; self.update_progress_window=None; self.update_control=None
         if window and window.winfo_exists(): window.destroy()
     def show_update(self,release):
         dialog=tk.Toplevel(self.root); dialog.withdraw(); set_window_icon(dialog); dialog.title('发现新版本'); dialog.resizable(False,False)
         ttk.Label(dialog,text='发现新版本 '+release['tag_name'],font=('Microsoft YaHei UI',13,'bold'),padding=12).pack(anchor='w')
+        row=ttk.Frame(dialog,padding=12); row.pack(side='bottom',fill='x')
         ttk.Label(dialog,text='更新内容：').pack(anchor='w',padx=12)
         content=ttk.Frame(dialog); content.pack(fill='both',expand=True,padx=12,pady=8)
-        notes=tk.Text(content,wrap='word',font=('Microsoft YaHei UI',10),padx=12,pady=8,relief='flat',cursor='arrow')
+        notes=tk.Text(content,wrap='char',font=('Microsoft YaHei UI',10),padx=12,pady=8,relief='flat',cursor='arrow')
         scrollbar=ttk.Scrollbar(content,orient='vertical',command=notes.yview)
         notes.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side='right',fill='y'); notes.pack(side='left',fill='both',expand=True)
         render_release_notes(notes,release.get('body'))
-        row=ttk.Frame(dialog,padding=12); row.pack(fill='x')
         def accept():
             dialog.destroy()
             if not getattr(sys,'frozen',False):
                 self.update_status.set('源码运行模式请从发布页下载便携包。'); return
             self.update_busy=True; self.update_status.set('正在下载并校验更新，请稍候……')
-            self.show_update_progress()
+            self.update_control=updater.DownloadControl(); self.show_update_progress(); control=self.update_control
             def worker():
-                try: self.events.put(('update_ready',updater.prepare_update(release,self.setup_install,lambda *progress:self.events.put(('update_progress',progress)))))
+                try: self.events.put(('update_ready',updater.prepare_update(release,self.setup_install,lambda *progress:self.events.put(('update_progress',progress)),control)))
+                except updater.UpdateCancelled: self.events.put(('update_cancelled',None))
                 except Exception as error: self.events.put(('update_error',str(error)))
             threading.Thread(target=worker,daemon=True).start()
-        ttk.Button(row,text='更新并重启',command=accept).pack(side='left')
+        ttk.Button(row,text='下载并更新',command=accept).pack(side='left')
         ttk.Button(row,text='暂不更新',command=dialog.destroy).pack(side='right')
         self.apply_theme()
-        center_window(dialog,600,520); dialog.deiconify(); dialog.attributes('-topmost',True); dialog.lift()
+        center_window(dialog,min(600,dialog.winfo_screenwidth()-40),min(520,dialog.winfo_screenheight()-80)); dialog.deiconify(); dialog.attributes('-topmost',True); dialog.lift()
 
     def find_playing_process(self):
         if not process_capture_supported():
@@ -1665,6 +1733,8 @@ class App:
                 elif kind=='update_error':
                     self.close_update_progress(); self.update_busy=False; self.update_status.set('更新失败：'+str(value))
                     messagebox.showerror('更新失败',str(value),parent=self.root)
+                elif kind=='update_cancelled':
+                    self.close_update_progress(); self.update_busy=False; self.update_status.set('已取消更新，未完成的下载已清除。')
                 elif kind=='update_progress': self.update_download_progress(*value)
                 elif kind=='update_ready':
                     self.close_update_progress(); self.update_busy=False

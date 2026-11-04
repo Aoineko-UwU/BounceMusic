@@ -102,6 +102,14 @@ def test_manual_lock_still_corrects_phase():
         tracker.feed(signal[i:i+CHUNK],i/RATE)
     assert .46 < tracker.phase < .52
 
+def test_phase_correction_recovers_large_drift():
+    tracker=BeatTracker(phase_correction='high')
+    tracker.manual_bpm=120.; tracker.bpm=120.; tracker.phase=.20
+    signal=render(duration=18)
+    for i in range(0,len(signal)-CHUNK,CHUNK): tracker.feed(signal[i:i+CHUNK],i/RATE)
+    error=(tracker.phase+.25)%.5-.25
+    assert abs(error)<.06, error
+
 def test_windows_capture_capability():
     assert not process_capture_supported(19045)
     assert process_capture_supported(22000)
@@ -148,6 +156,7 @@ if __name__ == '__main__':
     test_feedback_needs_repeated_evidence()
     test_manual_lock_keeps_current_song_tempo()
     test_manual_lock_still_corrects_phase()
+    test_phase_correction_recovers_large_drift()
     test_windows_capture_capability()
     test_tempo_changes_are_corrected_gradually()
     test_subdivision_does_not_double_slow_songs_or_halve_fast_songs()

@@ -87,11 +87,16 @@ def test_window_and_image_flow():
                 assert dialog.resizable() == (0, 0)
                 content = next(child for child in dialog.winfo_children() if isinstance(child, module.ttk.Frame) and any(isinstance(item, module.tk.Text) for item in child.winfo_children()))
                 notes = next(child for child in content.winfo_children() if isinstance(child, module.tk.Text))
+                assert notes.cget('wrap')=='char'
                 assert any(isinstance(child, module.ttk.Scrollbar) for child in content.winfo_children())
                 rendered = notes.get('1.0','end')
                 assert '##' not in rendered and '**' not in rendered and '`' not in rendered
                 assert '本版本更新' in rendered and '•  改进 节奏 和 BPM' in rendered and '查看发布页' in rendered
+                assert not any(line.strip()=='•' for line in rendered.splitlines())
                 assert notes.tag_ranges('heading') and notes.tag_ranges('bullet') and notes.tag_ranges('link')
+                assert find_label(dialog,'更新内容：')
+                row=next(child for child in dialog.winfo_children() if isinstance(child,module.ttk.Frame) and any(isinstance(item,module.ttk.Button) and item.cget('text')=='下载并更新' for item in child.winfo_children()))
+                assert row.winfo_ismapped() and row.winfo_rooty()+row.winfo_height() <= dialog.winfo_rooty()+dialog.winfo_height()
                 dialog.destroy()
                 application.show_update_progress(); application.root.update()
                 near_center(application.update_progress_window)
@@ -167,10 +172,12 @@ def test_window_and_image_flow():
                 application.manual_bpm_text.set('115')
                 application.apply_manual_bpm()
                 assert application.analyzer.manual_bpm == 115.
+                assert not application.manual_unlock_button.instate(['disabled'])
                 assert 'bpm_examples' not in application.config
                 application.realign_rhythm()
                 assert application.analyzer.aligned and application.analyzer.manual_bpm == 115.
-                application.clear_manual_bpm()
+                application.manual_unlock_button.invoke()
+                assert application.analyzer.manual_bpm==0 and not application.manual_bpm_entry.instate(['disabled'])
                 application.manual_bpm_text.set('115')
                 application.apply_manual_bpm(True)
                 assert application.config['bpm_examples'][-1]['source'] == 'live'
@@ -333,6 +340,26 @@ def test_old_image_migration():
             try: assert application.shared_image_path=='stored:old.png' and 'stored:old.png' in application.recent_images
             finally: application.quit()
 
+def test_import_square_crop():
+    with tempfile.TemporaryDirectory() as directory:
+        root=Path(directory); source=root/'wide.png'; config=root/'设置.json'
+        image=Image.new('RGBA',(60,30),(255,0,0,0))
+        for x in range(15,45):
+            for y in range(30): image.putpixel((x,y),(0,255,0,255))
+        image.save(source)
+        with patch.object(module,'CONFIG',str(config)):
+            token=module.store_image(str(source))
+            with Image.open(module.image_file(token)) as result:
+                assert result.size==(30,30) and result.getpixel((0,0))==(0,255,0,255)
+            with Image.open(source) as original: assert original.size==(60,30)
+            assert module.store_image(str(source))==token
+            animated=root/'wide.gif'
+            frames=[Image.new('RGBA',(40,20),color) for color in ('red','blue')]
+            frames[0].save(animated,save_all=True,append_images=frames[1:],duration=[80,120],loop=0)
+            token=module.store_image(str(animated))
+            with Image.open(module.image_file(token)) as result:
+                assert result.size==(20,20) and result.n_frames==2
+
 
 if __name__ == '__main__':
     test_window_and_image_flow()
@@ -341,4 +368,5 @@ if __name__ == '__main__':
     test_image_picker_presets_and_recent()
     test_image_library_and_new_windows()
     test_old_image_migration()
+    test_import_square_crop()
     print('UI checks passed.')
