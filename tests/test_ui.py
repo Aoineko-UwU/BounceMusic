@@ -116,6 +116,7 @@ def test_window_and_image_flow():
                 assert application.flash_color == '#ffff00' and application.notice_color == '#ffff00'
                 assert application.notice_outline.get() and application.notice_outline_color == '#000000'
                 assert application.fast_bpm_threshold.get() == 190 and application.end_silence.get() == 3.5
+                assert application.flip_bpm_threshold.get() == 100
                 application.settings_notebook.select(1); application.settings_window.update()
                 with patch.object(module.colorchooser,'askcolor',return_value=((18,52,86),'#123456')):
                     application.color_preview.event_generate('<Button-1>'); application.settings_window.update()
@@ -142,7 +143,7 @@ def test_window_and_image_flow():
                 application.loading_target.current(1)
                 application.on_loading_target_selected()
                 assert (application.loading_x.get(),application.loading_y.get()) == (25,70)
-                for name in ('最高弹跳速度','渐隐时间','歌曲结束判定阈值'):
+                for name in ('最高弹跳速度','翻转 BPM 阈值','渐隐时间','歌曲结束判定阈值'):
                     application.settings_notebook.select(0 if name=='歌曲结束判定阈值' else 1)
                     application.settings_window.update()
                     label=find_label(application.settings_window,name)
@@ -353,6 +354,11 @@ def test_multi_import_and_new_presets():
                 application.show_image_picker(); application.root.update()
                 assert set(application.picker_thumbnails)>=set(module.PRESET_OPTIONS)
                 assert application.image_picker.winfo_height()<=application.root.winfo_screenheight()-48
+                def find_caption(widget,label):
+                    if isinstance(widget,module.tk.Label) and widget.cget('text')==label: return widget
+                    return next((found for child in widget.winfo_children() if (found:=find_caption(child,label))),None)
+                assert find_caption(application.image_picker,'one.png').bind('<Button-3>')
+                assert not find_caption(application.image_picker,'默认图片').bind('<Button-3>')
                 application.add_sprite(); other=application.sprites[-1]
                 first=application.sprites[0]
                 assert application.image_mode.get()=='uniform'
@@ -364,6 +370,29 @@ def test_multi_import_and_new_presets():
                 application.choose_image('preset:matou',target_sprite=first)
                 assert application.image_mode.get()=='multiple'
                 assert first.image_path=='preset:matou' and other.image_path==''
+                application.choose_image('stored:one.png',target_sprite=first)
+                application.choose_image('stored:one.png',target_sprite=other)
+                with patch.object(module.messagebox,'askyesno',return_value=False):
+                    assert not application.delete_imported_image('stored:one.png')
+                assert (root/'图片'/'one.png').exists()
+                with patch.object(module.messagebox,'askyesno',return_value=True):
+                    assert application.delete_imported_image('stored:one.png')
+                assert not (root/'图片'/'one.png').exists()
+                assert sources[0].exists() and sources[1].exists()
+                assert first.image_path=='' and other.image_path==''
+                assert 'stored:one.png' not in application.recent_images
+                assert 'stored:two.png' in application.recent_images
+                application.show_image_picker(); application.root.update()
+                caption=find_caption(application.image_picker,'two.png')
+                context_menus=[]
+                with patch.object(module.tk.Menu,'tk_popup',lambda menu,*args:context_menus.append(menu)):
+                    caption.event_generate('<Button-3>',x=4,y=4)
+                assert context_menus[0].entrycget(0,'label')=='删除图片'
+                with patch.object(module.messagebox,'askyesno',return_value=True):
+                    context_menus[0].invoke(0)
+                application.root.update()
+                assert not (root/'图片'/'two.png').exists()
+                assert 'stored:two.png' not in application.recent_images
             finally: application.quit()
 
 
@@ -375,20 +404,32 @@ def test_horizontal_flip_alternates_on_beats():
             try:
                 application.horizontal_flip.set(True)
                 class PlayingAnalyzer:
-                    beat=999.6
-                    def values(self): return 120., .2, self.beat, .12, 1.
+                    beat=999.1
+                    bpm=80.
+                    def values(self): return self.bpm, .2, self.beat, .12, 1.
                     def is_playing(self): return True
                 analyzer=PlayingAnalyzer()
                 application.analyzer=analyzer
-                application.root.after_cancel(application.tick_job)
-                with patch.object(module.time,'monotonic',return_value=1000.): application.tick()
+                def step(now,beat,bpm):
+                    analyzer.beat=beat; analyzer.bpm=bpm
+                    application.root.after_cancel(application.tick_job)
+                    with patch.object(module.time,'monotonic',return_value=now): application.tick()
+                step(1000.,999.1,80.)
                 assert application.flip_angle==180.
                 assert application.sprites[0].render_key[4] is True
-                analyzer.beat=1000.1
-                application.root.after_cancel(application.tick_job)
-                with patch.object(module.time,'monotonic',return_value=1000.5): application.tick()
+                step(1000.8,999.9,80.)
                 assert application.flip_angle==0.
                 assert application.sprites[0].render_key[4] is False
+                step(1001.3,1000.9,120.)
+                assert application.flip_angle==0. and application.flip_squash_count==1
+                step(1001.8,1001.4,120.)
+                assert application.flip_angle==180. and application.flip_squash_count==0
+                step(1002.3,1001.9,120.)
+                assert application.flip_angle==180. and application.flip_squash_count==1
+                step(1002.8,1002.4,120.)
+                assert application.flip_angle==0. and application.flip_squash_count==0
+                application.flip_bpm_threshold.set(130); application.save()
+                assert json.loads(Path(module.CONFIG).read_text(encoding='utf-8'))['flip_bpm_threshold']==130
             finally:
                 application.analyzer=None
                 application.quit()

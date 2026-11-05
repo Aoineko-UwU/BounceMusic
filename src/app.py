@@ -27,7 +27,7 @@ PRESET_DIR = os.path.join(ASSET_BASE, 'assets', 'presets')
 PRESET_NAMES = ('凑企鹅', '焗雪梨', '糖猫', 'baka', 'doro', 'ksm')
 PRESET_IMAGES = {'preset:' + name: os.path.join(PRESET_DIR, name + '.png') for name in PRESET_NAMES}
 PRESET_OPTIONS = ('', 'preset:matou', *PRESET_IMAGES)
-VERSION = '1.6.4'
+VERSION = '1.6.5'
 AUTHOR = '葵猫猫'
 
 def acquire_single_instance():
@@ -808,6 +808,7 @@ class App:
         self.analysis_bias = 1.0
         self.anim_sx = 1.0; self.anim_sy = 1.0
         self.flip_angle = 0.; self.flip_start_angle = 0.; self.flip_end_angle = 0.; self.flip_event_time = -1e9
+        self.flip_squash_count=0; self.flip_cadence=1
         self.last_frame_time = time.monotonic()
         self.tick_job = None
         self.flash_started = -1e9
@@ -828,6 +829,7 @@ class App:
         if self.fps.get() not in ('15','24','30','45','60','90','120','144'):
             self.fps.set('30')
         self.fast_bpm_threshold=tk.IntVar(value=max(80,min(240,int(self.config.get('fast_bpm_threshold',190)))))
+        self.flip_bpm_threshold=tk.IntVar(value=max(60,min(240,int(self.config.get('flip_bpm_threshold',100)))))
         self.amplitude = tk.DoubleVar(value=amplitude_from_config(self.config))
         self.horizontal_flip = tk.BooleanVar(value=bool(self.config.get('horizontal_flip',False)))
         # Manual alignment is temporary for the current song; previous songs do not leak into the next one.
@@ -1110,6 +1112,12 @@ class App:
         tk.Scale(row,variable=self.fast_bpm_threshold,from_=80,to=240,resolution=5,orient='horizontal',length=190,
                  showvalue=False,highlightthickness=0,command=self.set_fast_threshold).pack(side='left',padx=6)
         ttk.Label(row,textvariable=self.fast_bpm_threshold,width=4).pack(side='left'); ttk.Label(row,text='BPM').pack(side='left')
+        row=ttk.Frame(feature); row.pack(fill='x',pady=3)
+        ttk.Label(row,text='翻转 BPM 阈值',width=16).pack(side='left')
+        tk.Scale(row,variable=self.flip_bpm_threshold,from_=60,to=240,resolution=5,orient='horizontal',length=190,
+                 showvalue=False,highlightthickness=0,command=lambda value:self.save()).pack(side='left',padx=6)
+        ttk.Label(row,textvariable=self.flip_bpm_threshold,width=4).pack(side='left'); ttk.Label(row,text='BPM').pack(side='left')
+        ttk.Label(feature,text='达到阈值后，每压扁两次才水平翻转一次。',foreground='#666666').pack(anchor='w',pady=(0,4))
         for title,variable in [('BPM 矫正频率',self.bpm_correction),('节奏矫正频率',self.phase_correction)]:
             row=ttk.Frame(feature); row.pack(fill='x',pady=3)
             ttk.Label(row,text=title,width=16).pack(side='left')
@@ -1309,6 +1317,29 @@ class App:
     def remember_image(self,path):
         self.recent_images=[p for p in self.recent_images if os.path.normcase(p)!=os.path.normcase(path)]
         self.recent_images.insert(0,path)
+    def delete_imported_image(self,path,parent=None):
+        if not path.startswith('stored:') or path not in self.recent_images: return False
+        file=image_file(path)
+        if os.path.normcase(os.path.dirname(os.path.realpath(file))) != os.path.normcase(os.path.realpath(library_dir())):
+            return False
+        if not messagebox.askyesno('删除图片',f'确定从软件中删除“{self.image_name(path)}”吗？\n\n正在使用它的 Q弹窗口将改用默认图；电脑上原来的图片不会删除。',parent=parent or self.root):
+            return False
+        try: os.remove(file)
+        except FileNotFoundError: pass
+        except OSError as error:
+            messagebox.showerror('删除失败',str(error),parent=parent or self.root)
+            return False
+        self.recent_images.remove(path)
+        if self.shared_image_path==path:
+            self.shared_image_path=''; self.shared_original=self.get_image('')
+        for sprite in self.sprites:
+            if sprite.image_path==path:
+                sprite.image_path=''; sprite.original=self.get_image(''); sprite.render_key=None
+        self.image_cache.pop(path,None); self.picker_thumbnails.pop(path,None)
+        self.prune_image_cache(); self.refresh_sprite_list(); self.update_loading_preview()
+        self.status.set(f'已删除图片：{os.path.basename(file)}')
+        self.save()
+        return True
     def picker_thumbnail(self,path):
         if path not in self.picker_thumbnails:
             try:
@@ -1349,6 +1380,7 @@ class App:
         def scroll(event): canvas.yview_scroll(-int(event.delta/120) if event.delta else 0,'units')
         canvas.bind('<MouseWheel>',scroll)
         body.bind('<MouseWheel>',scroll)
+        picker_state={'expanded':False}
         def position_picker():
             picker.update_idletasks()
             width=picker.winfo_reqwidth()
@@ -1364,6 +1396,20 @@ class App:
             picker.geometry(f'{width}x{height}+{x}+{y}')
         def expand_picker():
             picker.withdraw(); populate(True); position_picker(); picker.deiconify(); picker.lift()
+        def delete_and_refresh(path):
+            if not self.delete_imported_image(path,parent=picker): return
+            def refresh():
+                if not picker.winfo_exists(): return
+                offset=canvas.yview()[0]
+                picker.withdraw(); populate(picker_state['expanded']); position_picker()
+                canvas.yview_moveto(offset); picker.deiconify(); picker.lift()
+            picker.after_idle(refresh)
+        def imported_context(event,path):
+            menu=tk.Menu(picker,tearoff=False)
+            if dark: menu.configure(bg='#30343d',fg='#f2f3f5',activebackground='#505866',activeforeground='#ffffff')
+            menu.add_command(label='删除图片',command=lambda p=path:delete_and_refresh(p))
+            try: menu.tk_popup(event.x_root,event.y_root)
+            finally: menu.grab_release()
         def tile(parent,path,column,row):
             selected=(self.shared_image_path if self.image_mode.get()=='uniform' else
                       self.selected_sprite().image_path if self.selected_sprite() else '') == path
@@ -1380,8 +1426,11 @@ class App:
             for widget in (card,picture,caption):
                 widget.bind('<Button-1>',lambda event,p=path:self.choose_image(p))
                 widget.bind('<MouseWheel>',scroll)
+                if path.startswith('stored:'):
+                    widget.bind('<Button-3>',lambda event,p=path:imported_context(event,p))
             return card
         def populate(expanded=False):
+            picker_state['expanded']=expanded
             for child in body.winfo_children(): child.destroy()
             ttk.Label(body,text='预设图片',font=('Microsoft YaHei UI',9,'bold')).pack(anchor='w',padx=6,pady=(2,1))
             presets=ttk.Frame(body); presets.pack(anchor='w')
@@ -1752,7 +1801,7 @@ class App:
                 loading_x=self.shared_loading_x, loading_y=self.shared_loading_y,
                 main_geometry=f'{max(610,self.root.winfo_width())}x{max(610,self.root.winfo_height())}',
                 size=self.size.get(), fps=int(self.fps.get()), amplitude=self.amplitude.get(), amplitude_scale_version=2,
-                horizontal_flip=self.horizontal_flip.get(),
+                horizontal_flip=self.horizontal_flip.get(), flip_bpm_threshold=self.flip_bpm_threshold.get(),
                 offset=0., feedback_enabled=self.feedback_enabled.get(),
                 end_silence=self.end_silence.get(),
                 fast_bpm_threshold=self.fast_bpm_threshold.get(),
@@ -1859,10 +1908,18 @@ class App:
         self.anim_sx+=(sx_target-self.anim_sx)*ease; self.anim_sy+=(sy_target-self.anim_sy)*ease
         if not self.horizontal_flip.get() or not self.analyzer or not bpm or not beat:
             self.flip_angle=0.; self.flip_start_angle=0.; self.flip_end_angle=0.; self.flip_event_time=-1e9
+            self.flip_squash_count=0; self.flip_cadence=1
         else:
+            cadence=2 if bpm>=self.flip_bpm_threshold.get() else 1
+            if cadence!=self.flip_cadence:
+                self.flip_squash_count=0; self.flip_cadence=cadence
             if active and 0 <= age and event_time > self.flip_event_time + .12:
                 self.flip_start_angle=self.flip_angle
-                self.flip_end_angle=0. if self.flip_end_angle >= 90. else 180.
+                self.flip_squash_count+=1
+                if self.flip_squash_count>=cadence:
+                    self.flip_squash_count=0
+                    self.flip_end_angle=0. if self.flip_end_angle >= 90. else 180.
+                else: self.flip_end_angle=self.flip_angle
                 self.flip_event_time=event_time
             turn_age=now-self.flip_event_time
             if turn_age >= 0:
