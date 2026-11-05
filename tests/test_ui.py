@@ -2,6 +2,7 @@
 import json
 import sys
 import tempfile
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -44,6 +45,10 @@ def test_window_and_image_flow():
                 assert module.amplitude_from_config({'amplitude':125}) == 100.
                 assert module.amplitude_from_config({'amplitude':100,'amplitude_scale_version':2}) == 100.
                 assert module.animation_amplitude(50) == .625 and module.animation_amplitude(150) == 1.875
+                assert application.horizontal_flip.get() is False
+                assert module.flip_projection(0)==(1.,False)
+                assert module.flip_projection(90)[0] == .06
+                assert module.flip_projection(180)[1] is True
                 application.root.geometry('800x720')
                 application.root.update()
                 for name in ('动画幅度',):
@@ -273,7 +278,7 @@ def test_image_picker_presets_and_recent():
                     application.remember_image(other)
                 application.show_image_picker(); application.root.update()
                 def find_button(widget,label):
-                    if isinstance(widget,module.ttk.Button) and widget.cget('text')==label: return widget
+                    if isinstance(widget,module.ttk.Button) and widget.cget('text').startswith(label): return widget
                     return next((found for child in widget.winfo_children() if (found:=find_button(child,label))),None)
                 more=find_button(application.image_picker,'…'); assert more
                 more.invoke(); application.root.update()
@@ -293,7 +298,7 @@ def test_image_library_and_new_windows():
                 near_center(application.root)
                 application.image_mode.set('multiple')
                 original=application.selected_sprite().image_path
-                with patch.object(module.filedialog,'askopenfilename',return_value=str(source)):
+                with patch.object(module.filedialog,'askopenfilenames',return_value=(str(source),)):
                     application.import_image()
                 stored='stored:original.png'
                 assert application.selected_sprite().image_path==original
@@ -303,6 +308,12 @@ def test_image_library_and_new_windows():
                 assert application.selected_sprite().image_path==stored
                 application.add_sprite()
                 assert application.sprites[-1].image_path==stored
+                application.choose_image('preset:matou',target_sprite=application.sprites[0])
+                assert application.sprites[0].image_path=='preset:matou'
+                assert application.sprites[-1].image_path==stored
+                application.horizontal_flip.set(True); application.save()
+                assert json.loads(Path(config).read_text(encoding='utf-8'))['horizontal_flip'] is True
+                application.choose_image(stored,target_sprite=application.sprites[0])
                 application.choose_image('preset:matou')
                 application.add_sprite()
                 assert application.sprites[-1].image_path=='preset:matou'
@@ -321,6 +332,66 @@ def test_image_library_and_new_windows():
             application=module.App()
             try: assert stored in application.recent_images
             finally: application.quit()
+
+
+def test_multi_import_and_new_presets():
+    with tempfile.TemporaryDirectory() as directory:
+        root=Path(directory); config=str(root/'设置.json')
+        sources=[root/'one.png',root/'two.png']
+        for path in sources: Image.new('RGBA',(32,32),'red').save(path)
+        with patch.object(module,'CONFIG',config),patch.object(module.App,'make_tray'),patch.object(module.App,'refresh_sources'):
+            application=module.App()
+            try:
+                for token in module.PRESET_OPTIONS:
+                    if token: assert Path(module.image_file(token)).is_file()
+                before=application.selected_sprite().image_path
+                with patch.object(module.filedialog,'askopenfilenames',return_value=tuple(map(str,sources))):
+                    application.import_image()
+                assert application.selected_sprite().image_path==before
+                assert application.recent_images[:2]==['stored:one.png','stored:two.png']
+                assert all((root/'图片'/path.name).is_file() for path in sources)
+                application.show_image_picker(); application.root.update()
+                assert set(application.picker_thumbnails)>=set(module.PRESET_OPTIONS)
+                assert application.image_picker.winfo_height()<=application.root.winfo_screenheight()-48
+                application.add_sprite(); other=application.sprites[-1]
+                first=application.sprites[0]
+                assert application.image_mode.get()=='uniform'
+                menus=[]
+                with patch.object(module.tk.Menu,'tk_popup',lambda menu,*args:menus.append(menu)):
+                    first.context_menu(SimpleNamespace(x_root=100,y_root=100))
+                menu=menus[0]
+                assert '更改图像' in [menu.entrycget(index,'label') for index in range(menu.index('end')+1) if menu.type(index)=='cascade']
+                application.choose_image('preset:matou',target_sprite=first)
+                assert application.image_mode.get()=='multiple'
+                assert first.image_path=='preset:matou' and other.image_path==''
+            finally: application.quit()
+
+
+def test_horizontal_flip_alternates_on_beats():
+    with tempfile.TemporaryDirectory() as directory:
+        with patch.object(module,'CONFIG',str(Path(directory)/'设置.json')), \
+             patch.object(module.App,'make_tray'),patch.object(module.App,'refresh_sources'):
+            application=module.App()
+            try:
+                application.horizontal_flip.set(True)
+                class PlayingAnalyzer:
+                    beat=999.6
+                    def values(self): return 120., .2, self.beat, .12, 1.
+                    def is_playing(self): return True
+                analyzer=PlayingAnalyzer()
+                application.analyzer=analyzer
+                application.root.after_cancel(application.tick_job)
+                with patch.object(module.time,'monotonic',return_value=1000.): application.tick()
+                assert application.flip_angle==180.
+                assert application.sprites[0].render_key[4] is True
+                analyzer.beat=1000.1
+                application.root.after_cancel(application.tick_job)
+                with patch.object(module.time,'monotonic',return_value=1000.5): application.tick()
+                assert application.flip_angle==0.
+                assert application.sprites[0].render_key[4] is False
+            finally:
+                application.analyzer=None
+                application.quit()
 
 def test_old_image_migration():
     with tempfile.TemporaryDirectory() as directory:
@@ -369,4 +440,6 @@ if __name__ == '__main__':
     test_image_library_and_new_windows()
     test_old_image_migration()
     test_import_square_crop()
+    test_multi_import_and_new_presets()
+    test_horizontal_flip_alternates_on_beats()
     print('UI checks passed.')

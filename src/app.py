@@ -23,7 +23,11 @@ ASSET_BASE = getattr(sys, '_MEIPASS', os.path.dirname(os.path.dirname(os.path.ab
 LOADING_GIF = os.path.join(ASSET_BASE, 'assets', 'Loading.gif')
 APP_ICON = os.path.join(ASSET_BASE, 'assets', 'icon.ico')
 MATOU_IMAGE = os.path.join(ASSET_BASE, 'assets', 'matou.png')
-VERSION = '1.6.3'
+PRESET_DIR = os.path.join(ASSET_BASE, 'assets', 'presets')
+PRESET_NAMES = ('凑企鹅', '焗雪梨', '糖猫', 'baka', 'doro', 'ksm')
+PRESET_IMAGES = {'preset:' + name: os.path.join(PRESET_DIR, name + '.png') for name in PRESET_NAMES}
+PRESET_OPTIONS = ('', 'preset:matou', *PRESET_IMAGES)
+VERSION = '1.6.4'
 AUTHOR = '葵猫猫'
 
 def acquire_single_instance():
@@ -51,6 +55,7 @@ def library_dir():
 
 def image_file(path):
     if path == 'preset:matou': return MATOU_IMAGE
+    if path in PRESET_IMAGES: return PRESET_IMAGES[path]
     if path.startswith('stored:'):
         name=path[len('stored:'):]
         return os.path.join(library_dir(),name) if name and os.path.basename(name)==name else ''
@@ -137,6 +142,11 @@ def amplitude_from_config(config):
 
 def animation_amplitude(value):
     return max(.625,min(1.875,float(value)*.0125))
+
+def flip_projection(angle):
+    """A Y-axis card turn: width narrows edge-on, then the image faces the other way."""
+    projection=math.cos(math.radians(angle))
+    return max(.06,abs(projection)), projection < 0
 
 def set_window_icon(window):
     try: window.iconbitmap(APP_ICON)
@@ -598,6 +608,29 @@ class SpriteWindow:
             menu.configure(bg='#30343d',fg='#f2f3f5',activebackground='#505866',activeforeground='#ffffff')
         menu.add_command(label='打开主菜单', command=self.app.show_main)
         menu.add_command(label='打开设置', command=self.app.show_settings)
+        images=tk.Menu(menu,tearoff=False)
+        current_image=self.app.shared_image_path if self.app.image_mode.get()=='uniform' else self.image_path
+        if self.app.theme_mode.get()=='dark':
+            images.configure(bg='#30343d',fg='#f2f3f5',activebackground='#505866',activeforeground='#ffffff')
+        images.add_command(label='预设图片',state='disabled')
+        for path in PRESET_OPTIONS:
+            images.add_command(label=('✓  ' if current_image==path else '    ')+self.app.image_name(path),
+                               command=lambda p=path:self.app.choose_image(p,target_sprite=self))
+        images.add_separator()
+        images.add_command(label='我的图片',state='disabled')
+        if self.app.recent_images:
+            for start in range(0,len(self.app.recent_images),15):
+                subset=self.app.recent_images[start:start+15]
+                group=images if len(self.app.recent_images)<=15 else tk.Menu(images,tearoff=False)
+                if group is not images and self.app.theme_mode.get()=='dark':
+                    group.configure(bg='#30343d',fg='#f2f3f5',activebackground='#505866',activeforeground='#ffffff')
+                for path in subset:
+                    group.add_command(label=('✓  ' if current_image==path else '    ')+self.app.image_name(path),
+                                      command=lambda p=path:self.app.choose_image(p,target_sprite=self))
+                if group is not images:
+                    images.add_cascade(label=f'第 {start+1}–{start+len(subset)} 张',menu=group)
+        else: images.add_command(label='尚未导入图片',state='disabled')
+        menu.add_cascade(label='更改图像',menu=images)
         menu.add_command(label='新增Q弹', command=lambda: self.app.add_sprite(self))
         menu.add_command(label='刷新 BPM', command=self.app.refresh_bpm)
         menu.add_command(label='立即对齐节奏', command=self.app.realign_rhythm)
@@ -609,15 +642,16 @@ class SpriteWindow:
         finally:
             menu.grab_release()
 
-    def render(self, sx, sy, flash, color, loading_index=-1):
+    def render(self, sx, sy, flash, color, loading_index=-1, flip_angle=0.):
         original = self.app.shared_original if self.app.image_mode.get() == 'uniform' else self.original
         side = int(self.size*1.55)
         w0, h0 = original.size
         ratio = self.size / max(w0, h0)
-        w = max(1, int(w0*ratio*sx)); h = max(1, int(h0*ratio*sy))
+        projection, mirrored = flip_projection(flip_angle)
+        w = max(1, int(w0*ratio*sx*projection)); h = max(1, int(h0*ratio*sy))
         flash_step = round(flash*32)
         loading_position=self.app.get_loading_position(self) if loading_index>=0 else None
-        key = (id(original), side, w, h, flash_step, color if flash_step else None, loading_position, loading_index)
+        key = (id(original), side, w, h, mirrored, flash_step, color if flash_step else None, loading_position, loading_index)
         if key == self.render_key:
             return
         if key in self.app.frame_cache:
@@ -626,7 +660,9 @@ class SpriteWindow:
             self.render_key = key
             return
         canvas = Image.new('RGBA', (side, side), (255,0,255,0))
-        frame = self.app.render_source(original,self.size).resize((w,h), Image.Resampling.BILINEAR)
+        source=self.app.render_source(original,self.size)
+        if mirrored: source=source.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        frame = source.resize((w,h), Image.Resampling.BILINEAR)
         canvas.alpha_composite(frame, ((side-w)//2, int(side*.84)-h))
         if flash_step:
             alpha = canvas.getchannel('A')
@@ -771,6 +807,7 @@ class App:
         self.all_sources = []
         self.analysis_bias = 1.0
         self.anim_sx = 1.0; self.anim_sy = 1.0
+        self.flip_angle = 0.; self.flip_start_angle = 0.; self.flip_end_angle = 0.; self.flip_event_time = -1e9
         self.last_frame_time = time.monotonic()
         self.tick_job = None
         self.flash_started = -1e9
@@ -792,6 +829,7 @@ class App:
             self.fps.set('30')
         self.fast_bpm_threshold=tk.IntVar(value=max(80,min(240,int(self.config.get('fast_bpm_threshold',190)))))
         self.amplitude = tk.DoubleVar(value=amplitude_from_config(self.config))
+        self.horizontal_flip = tk.BooleanVar(value=bool(self.config.get('horizontal_flip',False)))
         # Manual alignment is temporary for the current song; previous songs do not leak into the next one.
         self.offset = tk.DoubleVar(value=0.)
         self.offset_label=tk.StringVar(value='自动对齐')
@@ -1012,6 +1050,7 @@ class App:
                  highlightthickness=0).grid(row=0,column=1,sticky='ew',padx=8)
         ttk.Label(row,textvariable=self.amplitude,width=7,anchor='e').grid(row=0,column=2)
         ttk.Label(row,text='%').grid(row=0,column=3,padx=(4,0))
+        ttk.Checkbutton(row,text='水平翻转动画',variable=self.horizontal_flip,command=self.save).grid(row=0,column=4,padx=(12,0))
         row=ttk.Frame(main); row.pack(fill='x',pady=5)
         ttk.Label(row,text='本曲节奏微调',width=14).pack(side='left')
         ttk.Button(row,text='提前一点',command=lambda:self.adjust_offset(-.02)).pack(side='left')
@@ -1161,7 +1200,7 @@ class App:
             self.image_cache[path]=square_image(image) if path.startswith('stored:') else image
         return self.image_cache[path]
     def image_name(self,path):
-        return '默认图片' if not path else ('玛头' if path=='preset:matou' else os.path.basename(image_file(path)))
+        return '默认图片' if not path else ('玛头' if path=='preset:matou' else path[7:] if path in PRESET_IMAGES else os.path.basename(image_file(path)))
     def render_source(self, original, size):
         limit=max(128,int(size*1.4)); key=(id(original),limit)
         if key not in self.resize_cache:
@@ -1252,13 +1291,21 @@ class App:
         sprite=self.make_sprite(path,self.size.get(),x,y)
         self.refresh_sprite_list(); self.select_sprite(sprite.id); self.save()
     def import_image(self):
-        path=filedialog.askopenfilename(parent=self.root,title='导入图片',filetypes=[('图片','*.png *.jpg *.jpeg *.webp *.bmp *.gif'),('所有文件','*.*')])
-        if not path: return
-        try:
-            stored=store_image(path); self.remember_image(stored); self.save()
-            self.status.set('图片已导入，点击“选择图片”即可使用。')
+        paths=filedialog.askopenfilenames(parent=self.root,title='导入图片（可一次选择多张）',
+            filetypes=[('图片','*.png *.jpg *.jpeg *.webp *.bmp *.gif'),('所有文件','*.*')])
+        if not paths: return
+        imported=[]; failed=[]
+        for path in paths:
+            try: imported.append(store_image(path))
+            except Exception as error: failed.append(f'{os.path.basename(path)}：{error}')
+        # Keep the selected batch in file-dialog order at the top of the picker.
+        for stored in reversed(imported): self.remember_image(stored)
+        if imported:
+            self.save()
+            self.status.set(f'已导入 {len(imported)} 张图片，点击“选择图片”即可使用。')
             if self.image_picker and self.image_picker.winfo_exists(): self.image_picker.destroy(); self.image_picker=None
-        except Exception as error: messagebox.showerror('图片导入失败',str(error),parent=self.root)
+        if failed:
+            messagebox.showerror('部分图片导入失败','\n'.join(failed[:8]) + (f'\n另有 {len(failed)-8} 张失败。' if len(failed)>8 else ''),parent=self.root)
     def remember_image(self,path):
         self.recent_images=[p for p in self.recent_images if os.path.normcase(p)!=os.path.normcase(path)]
         self.recent_images.insert(0,path)
@@ -1280,61 +1327,99 @@ class App:
         self.root.update_idletasks()
         picker=tk.Toplevel(self.root); picker.withdraw(); self.image_picker=picker
         picker.overrideredirect(True); picker.attributes('-topmost',True)
-        shell=ttk.Frame(picker,padding=8,relief='solid',borderwidth=1); shell.pack(fill='both',expand=True)
-        header=ttk.Frame(shell); header.pack(fill='x')
+        dark=self.theme_mode.get()=='dark'
+        background='#202329' if dark else '#f3f3f3'
+        card_color='#30343d' if dark else '#ffffff'
+        foreground='#f2f3f5' if dark else '#202329'
+        outline='#747c89' if dark else '#b8c4cc'
+        shell=tk.Frame(picker,bg=background,highlightbackground=outline,highlightthickness=1)
+        shell.pack(fill='both',expand=True)
+        header=ttk.Frame(shell,padding=(12,8)); header.pack(fill='x')
         ttk.Label(header,text='选择图片',font=('Microsoft YaHei UI',10,'bold')).pack(side='left')
         ttk.Button(header,text='×',width=3,command=picker.destroy).pack(side='right')
-        body=ttk.Frame(shell); body.pack(fill='both',expand=True)
+        canvas=tk.Canvas(shell,width=366,height=360,bg=background,highlightthickness=0,bd=0)
+        scrollbar=ttk.Scrollbar(shell,orient='vertical',command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side='left',fill='both',expand=True,padx=(8,0),pady=(0,8))
+        scrollbar.pack(side='right',fill='y',padx=(0,7),pady=(0,8))
+        body=ttk.Frame(canvas)
+        body_id=canvas.create_window((0,0),window=body,anchor='nw')
+        body.bind('<Configure>',lambda event:canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>',lambda event:canvas.itemconfigure(body_id,width=event.width))
+        def scroll(event): canvas.yview_scroll(-int(event.delta/120) if event.delta else 0,'units')
+        canvas.bind('<MouseWheel>',scroll)
+        body.bind('<MouseWheel>',scroll)
         def position_picker():
             picker.update_idletasks()
-            width,height=picker.winfo_reqwidth(),picker.winfo_reqheight()
-            x=self.image_picker_button.winfo_rootx()+self.image_picker_button.winfo_width()+8
-            y=self.image_picker_button.winfo_rooty()
-            x=max(0,min(x,picker.winfo_screenwidth()-width))
-            y=max(0,min(y,picker.winfo_screenheight()-height))
+            width=picker.winfo_reqwidth()
+            viewport=min(430, max(130,body.winfo_reqheight()+4), max(130,picker.winfo_screenheight()-110))
+            canvas.configure(height=viewport)
+            picker.update_idletasks()
+            height=picker.winfo_reqheight()
+            button_x=self.image_picker_button.winfo_rootx()
+            right=button_x+self.image_picker_button.winfo_width()+8
+            left=button_x-width-8
+            x=right if right+width <= picker.winfo_screenwidth()-8 else left if left>=8 else max(8,picker.winfo_screenwidth()-width-8)
+            y=max(8,min(self.image_picker_button.winfo_rooty(),picker.winfo_screenheight()-height-48))
             picker.geometry(f'{width}x{height}+{x}+{y}')
         def expand_picker():
             picker.withdraw(); populate(True); position_picker(); picker.deiconify(); picker.lift()
         def tile(parent,path,column,row):
-            button=ttk.Button(parent,text=self.image_name(path),image=self.picker_thumbnail(path),compound='top',
-                              width=11,command=lambda p=path:self.choose_image(p))
-            button.grid(row=row,column=column,padx=3,pady=3,sticky='nsew')
-            return button
+            selected=(self.shared_image_path if self.image_mode.get()=='uniform' else
+                      self.selected_sprite().image_path if self.selected_sprite() else '') == path
+            card=tk.Frame(parent,width=108,height=94,bg=card_color,highlightthickness=2 if selected else 1,
+                          highlightbackground='#4fb6cb' if selected else outline,cursor='hand2')
+            card.grid(row=row,column=column,padx=4,pady=4,sticky='nsew')
+            card.pack_propagate(False)
+            picture=tk.Label(card,image=self.picker_thumbnail(path),bg=card_color,bd=0,cursor='hand2')
+            picture.pack(pady=(4,1))
+            name=self.image_name(path)
+            if len(name)>12: name=name[:10]+'…'
+            caption=tk.Label(card,text=name,bg=card_color,fg=foreground,font=('Microsoft YaHei UI',9),bd=0,cursor='hand2')
+            caption.pack()
+            for widget in (card,picture,caption):
+                widget.bind('<Button-1>',lambda event,p=path:self.choose_image(p))
+                widget.bind('<MouseWheel>',scroll)
+            return card
         def populate(expanded=False):
             for child in body.winfo_children(): child.destroy()
-            ttk.Label(body,text='预设图片').pack(anchor='w',pady=(4,0))
+            ttk.Label(body,text='预设图片',font=('Microsoft YaHei UI',9,'bold')).pack(anchor='w',padx=6,pady=(2,1))
             presets=ttk.Frame(body); presets.pack(anchor='w')
-            tile(presets,'',0,0); tile(presets,'preset:matou',1,0)
-            ttk.Label(body,text='我的图片').pack(anchor='w',pady=(7,0))
+            for index,path in enumerate(PRESET_OPTIONS): tile(presets,path,index%3,index//3)
+            ttk.Label(body,text='我的图片',font=('Microsoft YaHei UI',9,'bold')).pack(anchor='w',padx=6,pady=(7,1))
             if not self.recent_images:
-                ttk.Label(body,text='导入图片后会显示在这里。',foreground='#777777').pack(anchor='w',pady=6); return
-            if expanded:
-                wrap=ttk.Frame(body); wrap.pack(fill='both',expand=True)
-                canvas=tk.Canvas(wrap,width=360,height=240,highlightthickness=0,
-                                 bg='#202329' if self.theme_mode.get()=='dark' else '#f3f3f3')
-                bar=ttk.Scrollbar(wrap,orient='vertical',command=canvas.yview)
-                canvas.configure(yscrollcommand=bar.set); canvas.pack(side='left',fill='both',expand=True); bar.pack(side='right',fill='y')
-                grid=ttk.Frame(canvas); canvas.create_window((0,0),window=grid,anchor='nw')
-                grid.bind('<Configure>',lambda event:canvas.configure(scrollregion=canvas.bbox('all')))
-                def scroll(event): canvas.yview_scroll(-int(event.delta/120),'units')
-                canvas.bind('<MouseWheel>',scroll); grid.bind('<MouseWheel>',scroll)
-                for i,path in enumerate(self.recent_images): tile(grid,path,i%3,i//3).bind('<MouseWheel>',scroll)
+                ttk.Label(body,text='导入图片后会显示在这里。',foreground='#777777').pack(anchor='w',padx=7,pady=6)
             else:
                 grid=ttk.Frame(body); grid.pack(anchor='w')
-                for i,path in enumerate(self.recent_images[:5]): tile(grid,path,i%3,i//3)
-                if len(self.recent_images)>5:
-                    ttk.Button(grid,text='…',width=11,command=expand_picker).grid(row=1,column=2,padx=3,pady=3,sticky='nsew')
+                shown=self.recent_images if expanded else self.recent_images[:5]
+                for index,path in enumerate(shown): tile(grid,path,index%3,index//3)
+                if not expanded and len(self.recent_images)>5:
+                    ttk.Button(grid,text='…\n查看全部',width=13,command=expand_picker).grid(row=1,column=2,padx=4,pady=4,ipady=20,sticky='nsew')
+            picker.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox('all'))
+            canvas.yview_moveto(0)
         populate()
         picker.bind('<Escape>',lambda event:picker.destroy()); self.apply_theme()
         position_picker(); picker.deiconify(); picker.lift()
-    def choose_image(self,path,remember=False):
+    def choose_image(self,path,remember=False,target_sprite=None):
         if path and not path.startswith('preset:') and not os.path.isfile(image_file(path)):
             self.status.set('图片文件不存在，请重新导入。'); return
         try:
             if remember:
                 self.image_cache.pop(path,None); self.picker_thumbnails.pop(path,None)
             original=self.get_image(path)
-            if self.image_mode.get()=='uniform': self.shared_image_path=path; self.shared_original=original
+            if target_sprite is not None:
+                if self.image_mode.get()=='uniform' and len(self.sprites)>1:
+                    for sprite in self.sprites:
+                        sprite.image_path=self.shared_image_path; sprite.original=self.shared_original
+                        sprite.render_key=None
+                    self.image_mode.set('multiple')
+                    self.status.set('已切换到“使用多种图片”，本次只更改右键点击的窗口。')
+                elif self.image_mode.get()=='uniform':
+                    self.shared_image_path=path; self.shared_original=original
+                target_sprite.image_path=path; target_sprite.original=original
+                target_sprite.render_key=None
+            elif self.image_mode.get()=='uniform': self.shared_image_path=path; self.shared_original=original
             else:
                 sprite=self.selected_sprite()
                 if not sprite: sprite=self.make_sprite()
@@ -1667,6 +1752,7 @@ class App:
                 loading_x=self.shared_loading_x, loading_y=self.shared_loading_y,
                 main_geometry=f'{max(610,self.root.winfo_width())}x{max(610,self.root.winfo_height())}',
                 size=self.size.get(), fps=int(self.fps.get()), amplitude=self.amplitude.get(), amplitude_scale_version=2,
+                horizontal_flip=self.horizontal_flip.get(),
                 offset=0., feedback_enabled=self.feedback_enabled.get(),
                 end_silence=self.end_silence.get(),
                 fast_bpm_threshold=self.fast_bpm_threshold.get(),
@@ -1771,13 +1857,25 @@ class App:
         sx_target=base_sx+pulse*.34*amp; sy_target=base_sy-pulse*.30*amp
         ease=min(1.,dt*30.)
         self.anim_sx+=(sx_target-self.anim_sx)*ease; self.anim_sy+=(sy_target-self.anim_sy)*ease
+        if not self.horizontal_flip.get() or not self.analyzer or not bpm or not beat:
+            self.flip_angle=0.; self.flip_start_angle=0.; self.flip_end_angle=0.; self.flip_event_time=-1e9
+        else:
+            if active and 0 <= age and event_time > self.flip_event_time + .12:
+                self.flip_start_angle=self.flip_angle
+                self.flip_end_angle=0. if self.flip_end_angle >= 90. else 180.
+                self.flip_event_time=event_time
+            turn_age=now-self.flip_event_time
+            if turn_age >= 0:
+                progress=max(0.,min(1.,(turn_age-attack-hold)/release))
+                progress=progress*progress*(3.-2.*progress)
+                self.flip_angle=self.flip_start_angle+(self.flip_end_angle-self.flip_start_angle)*progress
         elapsed=now-self.flash_started; duration=max(.1,float(self.flash_duration.get()))
         flash=1-elapsed/duration if self.flash_enabled.get() and 0<=elapsed<duration else 0.
         color=tuple(int(self.flash_color[i:i+2],16) for i in (1,3,5))
         loading_index=self.loading_frame_index(now) if playing and not bpm else -1
         self.frame_cache={}
         for sprite in self.sprites:
-            sprite.render(self.anim_sx,self.anim_sy,flash,color,loading_index)
+            sprite.render(self.anim_sx,self.anim_sy,flash,color,loading_index,self.flip_angle)
             sprite.update_notice(now)
         if self.settings_window and self.settings_window.winfo_exists() and self.settings_window.winfo_viewable():
             self.update_loading_preview()
