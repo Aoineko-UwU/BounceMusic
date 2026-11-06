@@ -9,33 +9,20 @@ import subprocess
 import sys
 import tempfile
 import threading
+import queue
+import time
 import urllib.request
 import urllib.error
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
+from download_routes import (ROUTES,DownloadControl,UpdateCancelled,probe_routes,route_name,route_order,download_asset)
 
 API = 'https://api.github.com/repos/Aoineko-UwU/BounceMusic/releases/latest'
 HEADERS = {'User-Agent': 'BounceMusic-Updater', 'Accept': 'application/vnd.github+json'}
 REPO = 'https://github.com/Aoineko-UwU/BounceMusic'
 MIRROR = 'https://ghfast.top/'
-
-class UpdateCancelled(Exception): pass
-
-class DownloadControl:
-    def __init__(self):
-        self.condition=threading.Condition(); self.paused=False; self.cancelled=False
-    def pause(self, paused):
-        with self.condition:
-            self.paused=paused; self.condition.notify_all()
-    def cancel(self):
-        with self.condition:
-            self.cancelled=True; self.condition.notify_all()
-    def checkpoint(self):
-        with self.condition:
-            while self.paused and not self.cancelled: self.condition.wait(.2)
-            if self.cancelled: raise UpdateCancelled('已取消更新下载')
 
 class TextExtractor(html.parser.HTMLParser):
     def __init__(self):
@@ -43,7 +30,7 @@ class TextExtractor(html.parser.HTMLParser):
     def handle_starttag(self, tag, attrs):
         if tag in ('p','li','h1','h2','h3','br'): self.parts.append('\n')
     def handle_data(self, data): self.parts.append(data)
-    def text(self): return ''.join(self.parts).strip()
+    def text(self): return re.sub(r'\n[ \t]*(?:\n[ \t]*)+','\n\n',''.join(self.parts)).strip()
 
 class AssetExtractor(html.parser.HTMLParser):
     def __init__(self, name):
@@ -55,19 +42,19 @@ class AssetExtractor(html.parser.HTMLParser):
             self.digest=attr.get('value')
 
 def release_from_web():
-    with urllib.request.urlopen(urllib.request.Request(REPO+'/releases/latest',headers=HEADERS),timeout=20) as response:
+    with urllib.request.urlopen(urllib.request.Request(REPO+'/releases/latest',headers=HEADERS),timeout=6) as response:
         final=urlparse(response.geturl())
         if final.scheme!='https' or final.hostname!='github.com': raise ValueError('更新页面地址无效')
         tag=final.path.rsplit('/',1)[-1]
     version_tuple(tag)
-    with urllib.request.urlopen(urllib.request.Request(REPO+'/releases.atom',headers=HEADERS),timeout=20) as response:
+    with urllib.request.urlopen(urllib.request.Request(REPO+'/releases.atom',headers=HEADERS),timeout=6) as response:
         feed=ET.fromstring(response.read(2*1024*1024))
     ns={'a':'http://www.w3.org/2005/Atom'}; body=''
     for entry in feed.findall('a:entry',ns):
         link=entry.find('a:link',ns)
         if link is not None and link.get('href','').endswith('/'+tag):
             parser=TextExtractor(); parser.feed(entry.findtext('a:content','',ns)); body=parser.text(); break
-    with urllib.request.urlopen(urllib.request.Request(REPO+'/releases/expanded_assets/'+tag,headers=HEADERS),timeout=20) as response:
+    with urllib.request.urlopen(urllib.request.Request(REPO+'/releases/expanded_assets/'+tag,headers=HEADERS),timeout=6) as response:
         page=response.read(2*1024*1024).decode('utf-8')
     assets=[]
     for suffix in ('-win64.zip','-Setup-win64.exe'):
@@ -83,15 +70,32 @@ def version_tuple(value):
     return tuple(map(int, match.groups()))
 
 def latest_release():
-    request = urllib.request.Request(API, headers=HEADERS)
+    mailbox=queue.Queue()
+    def api():
+        with urllib.request.urlopen(urllib.request.Request(API,headers=HEADERS),timeout=6) as response: return json.load(response)
+    def work(fetch):
+        try:
+            release=fetch(); version_tuple(release.get('tag_name',''))
+            if release.get('draft') or release.get('prerelease'): raise ValueError('此版本不是正式版')
+            mailbox.put((release,None))
+        except Exception as error: mailbox.put((None,error))
+    threading.Thread(target=work,args=(api,),daemon=True).start()
+    received=0; errors=[]
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            release = json.load(response)
-    except (urllib.error.URLError,TimeoutError):
-        return release_from_web()
-    version_tuple(release.get('tag_name',''))
-    if release.get('draft') or release.get('prerelease'): raise ValueError('此版本不是正式版')
-    return release
+        release,error=mailbox.get(timeout=.8); received=1
+        if release: return release
+        errors.append(str(error))
+    except queue.Empty: pass
+    # Both channels remain on GitHub; a slow API no longer blocks the webpage fallback.
+    threading.Thread(target=work,args=(release_from_web,),daemon=True).start()
+    deadline=time.monotonic()+20
+    while received<2 and time.monotonic()<deadline:
+        try: release,error=mailbox.get(timeout=max(.01,deadline-time.monotonic()))
+        except queue.Empty: break
+        received+=1
+        if release: return release
+        errors.append(str(error))
+    raise RuntimeError('无法获取官方更新信息：'+('；'.join(errors) or '请求超时'))
 
 def release_asset(release, setup=False):
     name = 'BounceMusic-' + release['tag_name'] + ('-Setup-win64.exe' if setup else '-win64.zip')
@@ -107,43 +111,15 @@ def release_asset(release, setup=False):
         return asset
     raise ValueError('发布页没有找到 Windows x64 '+('安装器' if setup else '便携包'))
 
-def prepare_update(release, setup=False, progress=None, control=None):
+def prepare_update(release, setup=False, progress=None, control=None,route='auto',route_tests=None,fallback=True):
     asset=release_asset(release,setup)
     expected_size=int(asset.get('size',0))
     if not 0 <= expected_size <= 500*1024*1024: raise ValueError('更新包大小不正确')
     stage=Path(tempfile.mkdtemp(prefix='BounceMusic-update-'))
     try:
         archive=stage/('setup.exe' if setup else 'update.zip')
-        for attempt,url in enumerate((MIRROR+asset['browser_download_url'],asset['browser_download_url'])):
-            if control: control.checkpoint()
-            digest=hashlib.sha256(); size=0; total=expected_size
-            try:
-                if progress: progress('mirror' if attempt==0 else 'direct',0,total)
-                request=urllib.request.Request(url,headers=HEADERS)
-                with urllib.request.urlopen(request,timeout=15) as response, archive.open('wb') as output:
-                    if not total:
-                        try: total=int(response.headers.get('Content-Length',0))
-                        except (AttributeError,TypeError,ValueError): total=0
-                        if not 0 < total <= 500*1024*1024: total=0
-                    if progress: progress('download',0,total)
-                    while True:
-                        if control: control.checkpoint()
-                        block=response.read(65536)
-                        if control: control.checkpoint()
-                        if not block: break
-                        size+=len(block)
-                        if size>(expected_size or 500*1024*1024): raise ValueError('更新包大小超过预期')
-                        digest.update(block); output.write(block)
-                        if progress: progress('download',size,total)
-                if control: control.checkpoint()
-                if progress: progress('verify',size,total)
-                if not size or (expected_size and size != expected_size) or digest.hexdigest().lower() != asset['digest'][7:].lower():
-                    raise ValueError('更新包校验失败')
-                if control: control.checkpoint()
-                break
-            except UpdateCancelled: raise
-            except (OSError,ValueError,urllib.error.URLError):
-                if attempt: raise
+        download_asset(asset,archive,progress,control,route,route_tests,fallback)
+        size=archive.stat().st_size; total=size
         if setup: return str(stage)
         if progress: progress('extract',size,total)
         extracted=stage/'files'; extracted.mkdir()

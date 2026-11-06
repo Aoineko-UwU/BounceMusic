@@ -13,6 +13,7 @@ import comtypes
 from proctap import ProcessAudioCapture
 from PIL import Image, ImageDraw, ImageTk, ImageOps, ImageSequence, ImageFont
 import updater
+from update_ui import UpdatePanel
 from media_status import MediaMonitor
 from animation import flip_pose, perspective_frame
 
@@ -840,6 +841,7 @@ class App:
         self.flash_started = -1e9
         self.bpm_notice_started = -1e9; self.bpm_notice_value = 0
         self.update_busy = False; self.update_release = None; self.update_progress_window = None; self.update_control = None
+        self.update_ui=UpdatePanel(self)
         self.setup_install = os.path.isfile(os.path.join(BASE,'.bounce-installed'))
         self.shared_image_path = self.config.get('image','')
         self.shared_original = self.get_image(self.shared_image_path)
@@ -1227,6 +1229,7 @@ class App:
             link.pack(anchor='w',pady=3); link.bind('<Button-1>',lambda event,target=url:webbrowser.open(target))
         self.update_status=tk.StringVar(value='点击检查更新，获取最新版本信息。')
         ttk.Button(about,text='检查更新',command=self.check_updates).pack(anchor='w',pady=(16,8))
+        ttk.Button(about,text='下载线路与测速',command=self.update_ui.show_route_settings).pack(anchor='w',pady=(0,8))
         ttk.Label(about,textvariable=self.update_status,wraplength=440).pack(anchor='w')
         window.protocol('WM_DELETE_WINDOW',lambda: (self.save(),window.withdraw()))
         self.apply_theme()
@@ -1287,6 +1290,7 @@ class App:
         self.root.withdraw()
     def quit(self):
         self.save()
+        self.update_ui.close()
         if self.tick_job:
             try: self.root.after_cancel(self.tick_job)
             except tk.TclError: pass
@@ -1682,82 +1686,15 @@ class App:
         if chosen:
             self.notice_outline_color=chosen; self.outline_preview.config(bg=chosen); self.save()
     def check_updates(self):
-        if self.update_busy: return
-        self.update_busy=True; self.update_status.set('正在检查更新……')
-        def worker():
-            try: self.events.put(('update_checked',updater.latest_release()))
-            except Exception as error: self.events.put(('update_error',str(error)))
-        threading.Thread(target=worker,daemon=True).start()
+        self.update_ui.check_updates()
     def show_update_progress(self):
-        window=tk.Toplevel(self.root); window.withdraw(); self.update_progress_window=window
-        set_window_icon(window); window.title('正在更新'); window.resizable(False,False)
-        self.update_progress_text=tk.StringVar(value='正在连接下载服务器……')
-        ttk.Label(window,text='正在准备更新',font=('Microsoft YaHei UI',12,'bold')).pack(anchor='w',padx=18,pady=(16,8))
-        ttk.Label(window,textvariable=self.update_progress_text).pack(anchor='w',padx=18)
-        self.update_progress_bar=ttk.Progressbar(window,mode='indeterminate')
-        self.update_progress_bar.pack(fill='x',padx=18,pady=(12,8)); self.update_progress_bar.start(12)
-        if self.update_control is None: self.update_control=updater.DownloadControl()
-        row=ttk.Frame(window); row.pack(fill='x',padx=18,pady=(0,12))
-        def toggle_pause():
-            paused=not self.update_control.paused; self.update_control.pause(paused)
-            self.update_pause_button.config(text='继续下载' if paused else '暂停下载')
-            if paused: self.update_progress_text.set('已暂停下载')
-        def cancel():
-            self.update_control.cancel(); self.update_progress_text.set('正在取消并清理下载……')
-            self.update_pause_button.state(['disabled']); self.update_cancel_button.state(['disabled'])
-        self.update_pause_button=ttk.Button(row,text='暂停下载',command=toggle_pause); self.update_pause_button.pack(side='left')
-        self.update_cancel_button=ttk.Button(row,text='中断下载',command=cancel); self.update_cancel_button.pack(side='right')
-        window.protocol('WM_DELETE_WINDOW',lambda: None)
-        self.apply_theme(); center_window(window,460,195); window.deiconify(); window.attributes('-topmost',True); window.lift()
-    def update_download_progress(self, phase, size, total):
-        window=self.update_progress_window
-        if not window or not window.winfo_exists(): return
-        if self.update_control and (self.update_control.cancelled or self.update_control.paused): return
-        bar=self.update_progress_bar
-        if phase in ('mirror','direct'):
-            self.update_pause_button.state(['!disabled']); self.update_cancel_button.state(['!disabled'])
-            message='正在连接加速节点……' if phase=='mirror' else '加速节点不可用，正在连接 GitHub……'
-        elif phase=='download':
-            if total:
-                bar.stop(); bar.configure(mode='determinate',maximum=total,value=min(size,total))
-                message=f'正在下载：{size/1048576:.1f} / {total/1048576:.1f} MB（{min(100,size*100/total):.0f}%）'
-            else:
-                if str(bar.cget('mode'))!='indeterminate': bar.configure(mode='indeterminate'); bar.start(12)
-                message=f'正在下载：{size/1048576:.1f} MB'
-        else:
-            self.update_pause_button.state(['disabled']); self.update_cancel_button.state(['disabled'])
-            bar.stop(); bar.configure(mode='indeterminate'); bar.start(12)
-            message='正在校验更新包……' if phase=='verify' else '正在解压更新包……'
-        self.update_progress_text.set(message); self.update_status.set(message)
+        self.update_ui.show_progress()
+    def update_download_progress(self,phase,size,total):
+        self.update_ui.progress(phase,size,total)
     def close_update_progress(self):
-        window=self.update_progress_window; self.update_progress_window=None; self.update_control=None
-        if window and window.winfo_exists(): window.destroy()
+        self.update_ui.close_progress()
     def show_update(self,release):
-        dialog=tk.Toplevel(self.root); dialog.withdraw(); set_window_icon(dialog); dialog.title('发现新版本'); dialog.resizable(False,False)
-        ttk.Label(dialog,text='发现新版本 '+release['tag_name'],font=('Microsoft YaHei UI',13,'bold'),padding=12).pack(anchor='w')
-        row=ttk.Frame(dialog,padding=12); row.pack(side='bottom',fill='x')
-        ttk.Label(dialog,text='更新内容：').pack(anchor='w',padx=12)
-        content=ttk.Frame(dialog); content.pack(fill='both',expand=True,padx=12,pady=8)
-        notes=tk.Text(content,wrap='char',font=('Microsoft YaHei UI',10),padx=12,pady=8,relief='flat',cursor='arrow')
-        scrollbar=ttk.Scrollbar(content,orient='vertical',command=notes.yview)
-        notes.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side='right',fill='y'); notes.pack(side='left',fill='both',expand=True)
-        render_release_notes(notes,release.get('body'))
-        def accept():
-            dialog.destroy()
-            if not getattr(sys,'frozen',False):
-                self.update_status.set('源码运行模式请从发布页下载便携包。'); return
-            self.update_busy=True; self.update_status.set('正在下载并校验更新，请稍候……')
-            self.update_control=updater.DownloadControl(); self.show_update_progress(); control=self.update_control
-            def worker():
-                try: self.events.put(('update_ready',updater.prepare_update(release,self.setup_install,lambda *progress:self.events.put(('update_progress',progress)),control)))
-                except updater.UpdateCancelled: self.events.put(('update_cancelled',None))
-                except Exception as error: self.events.put(('update_error',str(error)))
-            threading.Thread(target=worker,daemon=True).start()
-        ttk.Button(row,text='下载并更新',command=accept).pack(side='left')
-        ttk.Button(row,text='暂不更新',command=dialog.destroy).pack(side='right')
-        self.apply_theme()
-        center_window(dialog,min(600,dialog.winfo_screenwidth()-40),min(520,dialog.winfo_screenheight()-80)); dialog.deiconify(); dialog.attributes('-topmost',True); dialog.lift()
+        self.update_ui.show_release(release)
 
     def find_playing_process(self):
         if not process_capture_supported():
@@ -1946,6 +1883,8 @@ class App:
                     if self.notice_enabled.get():
                         self.bpm_notice_started=time.monotonic(); self.bpm_notice_value=value
                     self.status.set('BPM 已锁定：'+str(round(value)))
+                elif kind in ('update_route_result','update_route_metadata','update_route_error'):
+                    self.update_ui.handle_event(kind,value)
                 elif kind=='update_checked':
                     self.update_busy=False
                     try:
@@ -1955,8 +1894,7 @@ class App:
                         else: self.update_status.set('当前已是最新版本。')
                     except Exception as error: self.update_status.set('检查更新失败：'+str(error))
                 elif kind=='update_error':
-                    self.close_update_progress(); self.update_busy=False; self.update_status.set('更新失败：'+str(value))
-                    messagebox.showerror('更新失败',str(value),parent=self.root)
+                    self.update_ui.failed(str(value))
                 elif kind=='update_cancelled':
                     self.close_update_progress(); self.update_busy=False; self.update_status.set('已取消更新，未完成的下载已清除。')
                 elif kind=='update_progress': self.update_download_progress(*value)
