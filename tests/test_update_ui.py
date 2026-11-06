@@ -16,6 +16,19 @@ def test_routes_and_progress():
             panel=application.update_ui; panel.show_release(release); application.root.update()
             tree=panel.route_tree
             assert len(tree.get_children())==5
+            style=app.ttk.Style(application.root)
+            for mode,foreground,background in [('dark','#f2f3f5','#30343d'),('light','#161616','#ffffff')]:
+                application.theme_mode.set(mode); application.apply_theme()
+                assert style.lookup('Treeview','foreground')==foreground
+                assert style.lookup('Treeview','background')==background
+                assert style.lookup('Treeview','fieldbackground')==background
+                assert style.lookup('Treeview','foreground',('selected',))=='#ffffff'
+                assert style.lookup('Treeview','background',('selected',))=='#2769ad'
+                assert style.lookup('Treeview.Heading','foreground')==foreground
+                def has_focus(layout):
+                    return any(name.lower().endswith('.focus') or has_focus(options.get('children',[])) for name,options in layout)
+                for name in ('TButton','TCheckbutton','TRadiobutton','TNotebook.Tab'):
+                    assert not has_focus(style.layout(name))
             result={'id':'github','ok':True,'speed':2097152.,'latency':123.,'quality':'优'}
             panel.route_result(panel.probe_token,result)
             assert tree.item('github','values')[1]=='2.00 MB/s'

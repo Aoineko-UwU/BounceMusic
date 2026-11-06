@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageTk, ImageOps, ImageSequence, ImageFont
 import updater
 from update_ui import UpdatePanel
 from media_status import MediaMonitor
-from animation import flip_pose, flat_frame, feedback_frame, breathing_step
+from animation import flip_pose, flat_frame, perspective_frame, feedback_frame, breathing_step
 from shortcuts import DEFAULTS, BINDING_LABELS, mouse_code
 
 BASE = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
@@ -30,8 +30,9 @@ PRESET_DIR = os.path.join(ASSET_BASE, 'assets', 'presets')
 PRESET_NAMES = ('凑企鹅', '焗雪梨', '糖猫', 'baka', 'doro', 'ksm')
 PRESET_IMAGES = {'preset:' + name: os.path.join(PRESET_DIR, name + '.png') for name in PRESET_NAMES}
 PRESET_OPTIONS = ('', 'preset:matou', *PRESET_IMAGES)
-VERSION = '1.8.0'
+VERSION = '1.8.1'
 AUTHOR = '葵猫猫'
+FLIP_STYLES = {'平面翻转':'flat', '3D 翻转':'perspective'}
 
 def color_rgb(value):
     return tuple(int(value[index:index+2],16) for index in (1,3,5))
@@ -630,6 +631,7 @@ class SpriteWindow:
         self.app.select_sprite(self.id)
         self.app.size.set(self.size)
         self.app.save()
+        return 'break'
 
     def middle_click(self, event):
         self.app.select_sprite(self.id)
@@ -670,6 +672,12 @@ class SpriteWindow:
         menu.add_command(label='新增Q弹', command=lambda: self.app.add_sprite(self))
         menu.add_command(label='统一取消置顶' if self.app.top.get() else '统一置顶', command=self.app.toggle_top)
         menu.add_command(label='禁用翻转动画' if self.app.horizontal_flip.get() else '启用翻转动画',command=self.app.toggle_flip)
+        styles=tk.Menu(menu,tearoff=False)
+        if self.app.theme_mode.get()=='dark':
+            styles.configure(bg='#30343d',fg='#f2f3f5',activebackground='#505866',activeforeground='#ffffff')
+        for title,value in FLIP_STYLES.items():
+            styles.add_radiobutton(label=title,variable=self.app.flip_style,value=value,command=self.app.set_flip_style)
+        menu.add_cascade(label='翻转样式',menu=styles)
         menu.add_separator()
         menu.add_command(label='刷新 BPM', command=self.app.refresh_bpm)
         shortcut=BINDING_LABELS[self.app.shortcuts['align']]
@@ -695,8 +703,8 @@ class SpriteWindow:
         w = max(1, int(w0*ratio*sx)); h = max(1, int(h0*ratio*sy))
         flash_step = round(flash*32)
         loading_position=self.app.get_loading_position(self) if loading_index>=0 else None
-        effects=(idle_step,self.app.waiting_color if idle_step>=0 else None,
-                 shine_step,self.app.gloss_color if shine_step>=0 else None)
+        style=self.app.flip_style.get()
+        effects=(idle_step,style,shine_step,self.app.gloss_color if shine_step>=0 else None)
         key = (id(original), side, w, h, mirrored, angle, flash_step, color if flash_step else None,effects, loading_position, loading_index)
         if key == self.render_key:
             return
@@ -707,9 +715,11 @@ class SpriteWindow:
             return
         canvas = Image.new('RGBA', (side, side), (255,0,255,0))
         source=self.app.render_source(original,self.size)
-        frame=flat_frame(source,w,h,angle)
-        frame=feedback_frame(frame,idle_step,color_rgb(self.app.waiting_color),shine_step,color_rgb(self.app.gloss_color))
-        canvas.alpha_composite(frame, ((side-frame.width)//2, int(side*.84)-frame.height))
+        frame=(perspective_frame if style=='perspective' else flat_frame)(source,w,h,angle)
+        frame=feedback_frame(frame,idle_step=idle_step,shine_step=shine_step,shine_color=color_rgb(self.app.gloss_color))
+        sway=round(self.size*.025*math.sin(math.radians(2*angle))) if style=='perspective' else 0
+        lift=round(self.size*.035*abs(math.sin(math.radians(angle)))) if style=='perspective' else 0
+        canvas.alpha_composite(frame, ((side-frame.width)//2+sway, int(side*.84)-frame.height-lift))
         if flash_step:
             alpha = canvas.getchannel('A')
             tinted = Image.blend(canvas.convert('RGB'), Image.new('RGB', canvas.size, color), flash_step/32)
@@ -895,6 +905,8 @@ class App:
         self.flip_bpm_threshold=tk.IntVar(value=max(60,min(240,int(self.config.get('flip_bpm_threshold',100)))))
         self.amplitude = tk.DoubleVar(value=amplitude_from_config(self.config))
         self.horizontal_flip = tk.BooleanVar(value=bool(self.config.get('horizontal_flip',False)))
+        self.flip_style=tk.StringVar(value=self.config.get('flip_style','flat'))
+        if self.flip_style.get() not in FLIP_STYLES.values(): self.flip_style.set('flat')
         # Manual alignment is temporary for the current song; previous songs do not leak into the next one.
         self.offset = tk.DoubleVar(value=0.)
         self.offset_label=tk.StringVar(value='自动对齐')
@@ -919,7 +931,8 @@ class App:
         self.waiting_frequency=tk.DoubleVar(value=max(.2,min(2.,float(self.config.get('waiting_frequency',.5)))))
         self.gloss_enabled=tk.BooleanVar(value=self.config.get('gloss_enabled',True))
         self.gloss_duration=tk.DoubleVar(value=max(.15,min(1.5,float(self.config.get('gloss_duration',.45)))))
-        for name,default in (('waiting_color','#ffffff'),('gloss_color','#ffffff')):
+        self.config.pop('waiting_color',None)
+        for name,default in (('gloss_color','#ffffff'),):
             value=self.config.get(name,default)
             setattr(self,name,value if isinstance(value,str) and re.fullmatch(r'#[0-9a-fA-F]{6}',value) else default)
         self.bpm_correction = tk.StringVar(value=self.config.get('bpm_correction','auto'))
@@ -979,6 +992,20 @@ class App:
         style.map('TNotebook.Tab',padding=[('selected',(26,6)),('!selected',(20,6))],
                   background=[('selected',field)],foreground=[('selected',fg)])
         style.configure('Link.TLabel',background=bg,foreground='#75baff' if dark else '#0069c2')
+        style.configure('Treeview',background=field,fieldbackground=field,foreground=fg,rowheight=26,bordercolor=button)
+        style.map('Treeview',background=[('selected','#2769ad')],foreground=[('selected','#ffffff'),('disabled',muted)])
+        style.configure('Treeview.Heading',background=button,foreground=fg)
+        style.map('Treeview.Heading',background=[('active','#505866' if dark else '#d6d6d6')],foreground=[('active',fg)])
+        def without_focus(layout):
+            result=[]
+            for element,options in layout:
+                options=dict(options)
+                if 'children' in options: options['children']=without_focus(options['children'])
+                if element.lower().endswith('.focus'): result.extend(options.get('children',[]))
+                else: result.append((element,options))
+            return result
+        for name in ('TButton','TCheckbutton','TRadiobutton','TNotebook.Tab'):
+            style.layout(name,without_focus(style.layout(name)))
         self.root.option_add('*TCombobox*Listbox.background',field)
         self.root.option_add('*TCombobox*Listbox.foreground',fg)
         excluded={sprite.win for sprite in self.sprites}
@@ -1168,6 +1195,12 @@ class App:
         ttk.Label(row,text='（歌曲节奏复杂时不建议启用）',foreground='#666666').pack(side='left',padx=6)
         self.flip_shift_button=ttk.Button(row,text='快进一拍',width=11,command=self.shift_flip_beat)
         self.flip_shift_button.pack(side='right'); self.flip_shift_button.state(['disabled'])
+        row=ttk.Frame(animation); row.pack(fill='x',pady=(0,5))
+        ttk.Label(row,text='翻转样式',width=16).pack(side='left')
+        self.flip_style_combo=ttk.Combobox(row,values=list(FLIP_STYLES),state='readonly',width=16)
+        self.sync_flip_style()
+        self.flip_style_combo.pack(side='left')
+        self.flip_style_combo.bind('<<ComboboxSelected>>',self.set_flip_style)
         row=ttk.Frame(animation); row.pack(fill='x')
         ttk.Label(row,text='翻转 BPM 阈值',width=16).pack(side='left')
         ttk.Spinbox(row,from_=60,to=240,increment=5,textvariable=self.flip_bpm_threshold,width=6,
@@ -1280,7 +1313,7 @@ class App:
         ttk.Separator(feature).pack(fill='x',pady=7)
         row=ttk.Frame(feature); row.pack(fill='x',pady=3)
         ttk.Checkbutton(row,text='等待播放时呼吸闪烁',variable=self.waiting_enabled,command=self.save).pack(side='left')
-        self.waiting_preview=self.color_swatch(row,self.waiting_color,lambda:self.choose_effect_color('waiting_color','waiting_preview','选择等待闪烁颜色'))
+        ttk.Label(row,text='（原图亮度与暗色遮罩渐变）',foreground='#666666').pack(side='left',padx=6)
         row=ttk.Frame(feature); row.pack(fill='x')
         ttk.Label(row,text='呼吸频率',width=16).pack(side='left')
         tk.Scale(row,variable=self.waiting_frequency,from_=.2,to=2.,resolution=.1,orient='horizontal',length=190,
@@ -1692,6 +1725,11 @@ class App:
     def toggle_flip(self):
         self.horizontal_flip.set(not self.horizontal_flip.get())
         self.reset_flip_timing(); self.save()
+    def sync_flip_style(self):
+        self.flip_style_combo.set(next(name for name,value in FLIP_STYLES.items() if value==self.flip_style.get()))
+    def set_flip_style(self,event=None):
+        if event is not None: self.flip_style.set(FLIP_STYLES[self.flip_style_combo.get()])
+        self.sync_flip_style(); self.save()
     def shift_flip_beat(self):
         if not self.horizontal_flip.get() or not self.analyzer or not self.analyzer.is_playing():
             self.status.set('请先启用水平翻转，并播放音乐。'); return
@@ -1946,7 +1984,7 @@ class App:
                 loading_x=self.shared_loading_x, loading_y=self.shared_loading_y,
                 main_geometry=f'{max(610,self.root.winfo_width())}x{max(610,self.root.winfo_height())}',
                 size=self.size.get(), fps=int(self.fps.get()), amplitude=self.amplitude.get(), amplitude_scale_version=2,
-                horizontal_flip=self.horizontal_flip.get(), flip_bpm_threshold=self.flip_bpm_threshold.get(),
+                horizontal_flip=self.horizontal_flip.get(), flip_style=self.flip_style.get(), flip_bpm_threshold=self.flip_bpm_threshold.get(),
                 offset=0., feedback_enabled=self.feedback_enabled.get(),
                 end_silence=self.end_silence.get(),
                 fast_bpm_threshold=self.fast_bpm_threshold.get(),
@@ -1955,7 +1993,7 @@ class App:
                 flash_duration=self.flash_duration.get(), close_action=self.close_action.get(),
                 notice_enabled=self.notice_enabled.get(), notice_color=self.notice_color, notice_duration=self.notice_duration.get(),
                 notice_outline=self.notice_outline.get(), notice_outline_color=self.notice_outline_color, theme_mode=self.theme_mode.get(),
-                waiting_enabled=self.waiting_enabled.get(),waiting_frequency=self.waiting_frequency.get(),waiting_color=self.waiting_color,
+                waiting_enabled=self.waiting_enabled.get(),waiting_frequency=self.waiting_frequency.get(),
                 gloss_enabled=self.gloss_enabled.get(),gloss_duration=self.gloss_duration.get(),gloss_color=self.gloss_color,
                 bpm_correction=self.bpm_correction.get(), phase_correction=self.phase_correction.get())
             self.config['recent_images']=self.recent_images
@@ -2090,7 +2128,7 @@ class App:
             self.flip_last_index=index
             effective=index+self.flip_pair_offset+cadence*self.flip_face_bias
             self.flip_cadence=cadence; self.flip_squash_count=(index+self.flip_pair_offset+1)%cadence
-            self.flip_angle=flip_pose(effective,age,attack,hold,release,cadence)
+            self.flip_angle=flip_pose(effective,age,attack,hold,release,cadence,self.flip_style.get())
         elapsed=now-self.flash_started; duration=max(.1,float(self.flash_duration.get()))
         flash=1-elapsed/duration if self.flash_enabled.get() and 0<=elapsed<duration else 0.
         color=tuple(int(self.flash_color[i:i+2],16) for i in (1,3,5))

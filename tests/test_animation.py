@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 from PIL import Image, ImageDraw
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
-from animation import flip_pose, flat_frame, feedback_frame, breathing_step
+from animation import flip_pose, flat_frame, perspective_frame, feedback_frame, breathing_step
 from shortcuts import mouse_code
 
 
@@ -16,6 +16,8 @@ def test_flip_grid():
     # Sampling after skipped frames and reanchoring at index zero need no UI counter.
     assert pose(7,.5)==0. and pose(0,.5)==0.
     assert pose(1,.28)<pose(1,.38)
+    assert flip_pose(1,.5,.10,.08,.30,2,'perspective')==180.
+    assert flip_pose(1,.28,.10,.08,.30,2,'perspective')!=pose(1,.28)
 
 
 def test_flat_alpha():
@@ -35,6 +37,19 @@ def test_flat_alpha():
     assert source.getpixel((0,0))==(0,0,0,0)
 
 
+def test_perspective_alpha():
+    source=Image.new('RGBA',(100,100),(0,0,0,0))
+    ImageDraw.Draw(source).rectangle((20,10,79,89),fill='red')
+    source.putpixel((50,50),(0,0,0,0))
+    assert perspective_frame(source,100,100,0).tobytes()==source.tobytes()
+    assert perspective_frame(source,100,100,180).tobytes()==source.transpose(Image.Transpose.FLIP_LEFT_RIGHT).tobytes()
+    for angle in (30,60,90,120,150):
+        frame=perspective_frame(source,100,100,angle)
+        assert frame.mode=='RGBA' and frame.getchannel('A').getextrema()==(0,255)
+        assert frame.getpixel((0,0))[3]==0
+        assert frame.tobytes()!=flat_frame(source,100,100,angle).tobytes()
+
+
 def test_waiting_and_shine_alpha():
     source=Image.new('RGBA',(100,100),(40,80,160,255))
     source.putpixel((0,0),(0,0,0,0)); source.putpixel((50,50),(20,30,40,100))
@@ -42,13 +57,24 @@ def test_waiting_and_shine_alpha():
     shine=feedback_frame(source,shine_step=32,shine_color=(0,255,0))
     for frame in (dark,bright,shine): assert frame.getchannel('A').tobytes()==source.getchannel('A').tobytes()
     assert sum(dark.getpixel((20,20))[:3])<sum(bright.getpixel((20,20))[:3])
+    assert bright.tobytes()==source.tobytes()  # The original image is the brightest state.
+    for step in (0,16,32,48,64):
+        frame=feedback_frame(source,idle_step=step)
+        assert frame.getchannel('A').tobytes()==source.getchannel('A').tobytes()
+        assert all(new<=old for new,old in zip(frame.convert('RGB').tobytes(),source.convert('RGB').tobytes()))
     assert shine.getpixel((30,70))[1]>source.getpixel((30,70))[1]
     assert feedback_frame(source,shine_step=0).tobytes()==source.tobytes()
     assert feedback_frame(source,shine_step=64).tobytes()==source.tobytes()
     assert breathing_step(0,.5)==0 and breathing_step(1,.5)==64 and breathing_step(2,.5)==0
     assert mouse_code(1,1)=='shift+left' and mouse_code(2,1)=='shift+middle' and mouse_code(3,1)=='shift+right'
+    for locks in (0x8,0x2,0x20,0x2|0x8|0x20):
+        assert mouse_code(1,locks)=='left' and mouse_code(3,locks)=='right'
+        assert mouse_code(2,locks|1)=='shift+middle'
+    assert mouse_code(1,0x20000)=='alt+left'
+    assert mouse_code(1,0x20008)=='alt+left' and mouse_code(3,0x20009)=='alt+shift+right'
+    assert mouse_code(1,0x4)=='ctrl+left'
 
 
 if __name__=='__main__':
-    test_flip_grid(); test_flat_alpha(); test_waiting_and_shine_alpha()
+    test_flip_grid(); test_flat_alpha(); test_perspective_alpha(); test_waiting_and_shine_alpha()
     print('Animation checks passed.')

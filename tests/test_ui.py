@@ -521,6 +521,27 @@ def test_waiting_gloss_and_mouse_shortcuts():
                 assert application.visual_state=='playing' and application.idle_step==-1
                 assert application.sprites[0].render_key[-1]==-1
                 sprite=application.sprites[0]
+                application.root.update()
+                # Exercise the Tk binding, including Windows NumLock, rather than calling the handler directly.
+                with patch.object(sprite,'context_menu') as context:
+                    sprite.label.event_generate('<ButtonPress-3>',state=0x8,x=35,y=35)
+                    context.assert_called_once()
+                sprite.label.event_generate('<ButtonPress-1>',state=0x8,x=35,y=35)
+                assert sprite.drag is not None
+                before=(sprite.win.winfo_x(),sprite.win.winfo_y())
+                sprite.label.event_generate('<B1-Motion>',state=0x108,x=55,y=55)
+                application.root.update()
+                assert (sprite.win.winfo_x(),sprite.win.winfo_y())!=before
+                sprite.label.event_generate('<ButtonRelease-1>',state=0x108,x=55,y=55)
+                size=sprite.size
+                sprite.label.event_generate('<MouseWheel>',state=0x8,delta=120,x=35,y=35)
+                assert sprite.size==size+20
+                sprite.label.event_generate('<ButtonPress-2>',state=0x8,x=35,y=35)
+                assert player.aligned==1
+                player.aligned=0; application.gloss_requested=False
+                sprite.label.event_generate('<ButtonPress-1>',state=0x9,x=35,y=35)
+                assert application.offset.get()==-.02 and sprite.drag is None
+                application.reset_alignment(); player.aligned=0
                 def click(number,state=0):
                     return sprite.mouse_down(SimpleNamespace(num=number,state=state,x_root=100,y_root=100))
                 with patch.object(sprite,'context_menu') as context:
@@ -561,11 +582,22 @@ def test_waiting_gloss_and_mouse_shortcuts():
                     application.notice_preview.event_generate('<Button-1>'); application.root.update()
                     chooser.assert_not_called()
                 application.notice_enabled.set(True); application.set_notice_enabled()
-                application.waiting_frequency.set(.8); application.waiting_color='#55aaff'
+                assert not hasattr(application,'waiting_preview')
+                application.waiting_frequency.set(.8)
                 application.gloss_duration.set(.7); application.gloss_color='#ffff00'; application.save()
                 saved=json.loads(Path(module.CONFIG).read_text(encoding='utf-8'))
-                assert saved['waiting_frequency']==.8 and saved['waiting_color']=='#55aaff'
+                assert saved['waiting_frequency']==.8 and 'waiting_color' not in saved
                 assert saved['gloss_duration']==.7 and saved['gloss_color']=='#ffff00'
+                application.flip_style_combo.set('3D 翻转')
+                application.flip_style_combo.event_generate('<<ComboboxSelected>>')
+                assert application.flip_style.get()=='perspective'
+                assert json.loads(Path(module.CONFIG).read_text(encoding='utf-8'))['flip_style']=='perspective'
+                sprite.render(1.,1.,0.,(255,255,255),flip_angle=60)
+                perspective_photo=sprite.photo
+                application.flip_style.set('flat'); application.set_flip_style()
+                sprite.render(1.,1.,0.,(255,255,255),flip_angle=60)
+                assert sprite.photo is not perspective_photo
+                assert application.flip_style_combo.get()=='平面翻转'
                 text=module.tk.Text(application.root)
                 module.render_release_notes(text,'本次更新\n1、简短内容\n\n下载与安装\n后面的内容\n更新记录\n历史内容')
                 assert '简短内容' in text.get('1.0','end') and '后面的内容' not in text.get('1.0','end')
@@ -578,18 +610,22 @@ def test_old_image_migration():
     with tempfile.TemporaryDirectory() as directory:
         root=Path(directory); config=root/'设置.json'; old=root/'old.png'
         Image.new('RGBA',(20,20),'blue').save(old)
-        config.write_text(json.dumps({'image':str(old),'recent_images':[str(old)]}),encoding='utf-8')
+        config.write_text(json.dumps({'image':str(old),'recent_images':[str(old)],'flip_style':'perspective','waiting_color':'#ff0000'}),encoding='utf-8')
         with patch.object(module,'CONFIG',str(config)),patch.object(module.App,'make_tray'),patch.object(module.App,'refresh_sources'):
             application=module.App()
             try:
                 assert application.shared_image_path=='stored:old.png'
+                assert application.flip_style.get()=='perspective' and application.flip_style_combo.get()=='3D 翻转'
+                assert 'waiting_color' not in application.config
                 assert 'stored:old.png' in application.recent_images
                 assert old.exists() and (root/'图片'/'old.png').exists()
                 application.save()
             finally: application.quit()
             old.unlink()
             application=module.App()
-            try: assert application.shared_image_path=='stored:old.png' and 'stored:old.png' in application.recent_images
+            try:
+                assert application.shared_image_path=='stored:old.png' and 'stored:old.png' in application.recent_images
+                assert application.flip_style.get()=='perspective' and 'waiting_color' not in application.config
             finally: application.quit()
 
 def test_import_square_crop():
