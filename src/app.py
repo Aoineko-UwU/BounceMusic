@@ -14,7 +14,8 @@ from proctap import ProcessAudioCapture
 from PIL import Image, ImageDraw, ImageTk, ImageOps, ImageSequence, ImageFont
 import updater
 from media_status import MediaMonitor
-from animation import flip_pose, perspective_frame
+from animation import flip_pose, flat_frame, feedback_frame, breathing_step
+from shortcuts import DEFAULTS, BINDING_LABELS, mouse_code
 
 BASE = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(BASE, '设置.json')
@@ -28,8 +29,11 @@ PRESET_DIR = os.path.join(ASSET_BASE, 'assets', 'presets')
 PRESET_NAMES = ('凑企鹅', '焗雪梨', '糖猫', 'baka', 'doro', 'ksm')
 PRESET_IMAGES = {'preset:' + name: os.path.join(PRESET_DIR, name + '.png') for name in PRESET_NAMES}
 PRESET_OPTIONS = ('', 'preset:matou', *PRESET_IMAGES)
-VERSION = '1.7.0'
+VERSION = '1.8.0'
 AUTHOR = '葵猫猫'
+
+def color_rgb(value):
+    return tuple(int(value[index:index+2],16) for index in (1,3,5))
 
 def acquire_single_instance():
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -125,7 +129,7 @@ def render_release_notes(widget, body):
     for index,line in enumerate(lines):
         heading=re.match(r'^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$',line)
         if heading and index and re.search(r'下载|安装|运行|download|install',heading.group(1),re.I): break
-        if index and re.fullmatch(r'\s*(下载与运行|下载和运行|下载|安装|Download|Installation)\s*',line,re.I): break
+        if index and re.fullmatch(r'\s*(下载(?:(?:与|和)(?:运行|安装))?|安装|Download|Installation|SHA-?256|历史更新记录|更新记录)\s*',line,re.I): break
         bullet=re.match(r'^\s*[-*+]\s+(.+)$',line)
         start=widget.index('end-1c')
         if heading: insert_inline(heading.group(1)); tag='heading'
@@ -515,7 +519,10 @@ class Analyzer:
                         if tracker.bpm and any(now-t < 12 for t,_ in tracker.onsets):
                             tracker.align_phase(now); tracker.last_grid=None
                             self.events.put(('status','已根据近期鼓点重新对齐节奏，BPM 保持不变。'))
-                        else: self.events.put(('status','近期鼓点不足，暂时无法对齐，请保持音乐播放后重试。'))
+                            self.events.put(('rhythm_aligned',True))
+                        else:
+                            self.events.put(('status','近期鼓点不足，暂时无法对齐，请保持音乐播放后重试。'))
+                            self.events.put(('rhythm_aligned',False))
                     if self.manual_bpm and tracker.manual_bpm != self.manual_bpm:
                         tracker.manual_bpm=self.manual_bpm; tracker.bpm=self.manual_bpm
                         tracker.align_phase(now); tracker.last_grid=None; tracker.tempo_candidates.clear()
@@ -560,6 +567,7 @@ class SpriteWindow:
         self.render_key = None
         self.notice_window = None
         self.drag = None
+        self.suppress_double_until=0.
         self.win = tk.Toplevel(app.root); self.win.withdraw()
         self.win.overrideredirect(True)
         self.win.configure(bg=KEY)
@@ -567,11 +575,9 @@ class SpriteWindow:
         self.win.attributes('-topmost', app.top.get())
         self.label = tk.Label(self.win, bg=KEY, bd=0, highlightthickness=0)
         self.label.pack()
-        self.label.bind('<ButtonPress-1>', self.press)
+        for number in (1,2,3): self.label.bind(f'<ButtonPress-{number}>',self.mouse_down)
         self.label.bind('<B1-Motion>', self.move)
         self.label.bind('<Double-Button-1>', self.double_click)
-        self.label.bind('<Button-3>', self.context_menu)
-        self.label.bind('<Button-2>', self.middle_click)
         self.label.bind('<MouseWheel>', self.wheel)
         self.win.geometry('+%d+%d' % (max(0,int(x)), max(0,int(y))))
         self.win.deiconify()
@@ -594,10 +600,27 @@ class SpriteWindow:
         self.app.select_sprite(self.id)
         self.drag = (event.x_root-self.win.winfo_x(), event.y_root-self.win.winfo_y())
 
+    def mouse_down(self,event):
+        code=mouse_code(event.num,getattr(event,'state',0))
+        action=next((action for action,binding in self.app.shortcuts.items() if binding==code),None)
+        if action:
+            self.drag=None; self.suppress_double_until=time.monotonic()+.5
+            self.app.select_sprite(self.id); self.app.run_shortcut(action)
+            return 'break'
+        if '+' in code:
+            self.drag=None
+            return 'break'
+        if event.num==1: self.press(event)
+        elif event.num==3: self.context_menu(event)
+        return 'break'
+
     def move(self, event):
         if self.drag:
             self.win.geometry('+%d+%d' % (max(0,event.x_root-self.drag[0]), max(0,event.y_root-self.drag[1])))
     def double_click(self, event):
+        if event is not None and '+' in mouse_code(1,getattr(event,'state',0)):
+            return self.mouse_down(event)
+        if time.monotonic()<self.suppress_double_until: return 'break'
         if self.app.double_click_close.get():
             self.app.close_sprite(self.id)
 
@@ -609,7 +632,7 @@ class SpriteWindow:
 
     def middle_click(self, event):
         self.app.select_sprite(self.id)
-        self.app.realign_rhythm()
+        self.app.run_shortcut('align')
         return 'break'
 
     def context_menu(self, event):
@@ -645,11 +668,15 @@ class SpriteWindow:
         menu.add_cascade(label='更改图像',menu=images)
         menu.add_command(label='新增Q弹', command=lambda: self.app.add_sprite(self))
         menu.add_command(label='统一取消置顶' if self.app.top.get() else '统一置顶', command=self.app.toggle_top)
+        menu.add_command(label='禁用翻转动画' if self.app.horizontal_flip.get() else '启用翻转动画',command=self.app.toggle_flip)
         menu.add_separator()
         menu.add_command(label='刷新 BPM', command=self.app.refresh_bpm)
-        menu.add_command(label='立即对齐节奏（鼠标中键）', command=self.app.realign_rhythm)
-        menu.add_command(label='BPM ×2（不学习）', command=lambda:self.app.scale_bpm(2.))
-        menu.add_command(label='BPM ÷2（不学习）', command=lambda:self.app.scale_bpm(.5))
+        shortcut=BINDING_LABELS[self.app.shortcuts['align']]
+        menu.add_command(label='立即对齐节奏（'+shortcut+'）', command=lambda:self.app.run_shortcut('align'))
+        for action,title in (('earlier','节奏提前一点'),('later','节奏延后一点'),('auto','恢复自动')):
+            menu.add_command(label=title+'（'+BINDING_LABELS[self.app.shortcuts[action]]+'）',command=lambda a=action:self.app.run_shortcut(a))
+        menu.add_command(label='BPM ×2', command=lambda:self.app.scale_bpm(2.))
+        menu.add_command(label='BPM ÷2', command=lambda:self.app.scale_bpm(.5))
         menu.add_separator()
         menu.add_command(label='关闭图片', command=lambda: self.app.close_sprite(self.id))
         try:
@@ -657,7 +684,7 @@ class SpriteWindow:
         finally:
             menu.grab_release()
 
-    def render(self, sx, sy, flash, color, loading_index=-1, flip_angle=0.):
+    def render(self, sx, sy, flash, color, loading_index=-1, flip_angle=0., idle_step=-1, shine_step=-1):
         original = self.app.shared_original if self.app.image_mode.get() == 'uniform' else self.original
         side = int(self.size*1.55)
         w0, h0 = original.size
@@ -667,7 +694,9 @@ class SpriteWindow:
         w = max(1, int(w0*ratio*sx)); h = max(1, int(h0*ratio*sy))
         flash_step = round(flash*32)
         loading_position=self.app.get_loading_position(self) if loading_index>=0 else None
-        key = (id(original), side, w, h, mirrored, angle, flash_step, color if flash_step else None, loading_position, loading_index)
+        effects=(idle_step,self.app.waiting_color if idle_step>=0 else None,
+                 shine_step,self.app.gloss_color if shine_step>=0 else None)
+        key = (id(original), side, w, h, mirrored, angle, flash_step, color if flash_step else None,effects, loading_position, loading_index)
         if key == self.render_key:
             return
         if key in self.app.frame_cache:
@@ -677,10 +706,9 @@ class SpriteWindow:
             return
         canvas = Image.new('RGBA', (side, side), (255,0,255,0))
         source=self.app.render_source(original,self.size)
-        frame=perspective_frame(source,w,h,angle)
-        sway=round(self.size*.025*math.sin(math.radians(2*angle)))
-        lift=round(self.size*.035*abs(math.sin(math.radians(angle))))
-        canvas.alpha_composite(frame, ((side-frame.width)//2+sway, int(side*.84)-frame.height-lift))
+        frame=flat_frame(source,w,h,angle)
+        frame=feedback_frame(frame,idle_step,color_rgb(self.app.waiting_color),shine_step,color_rgb(self.app.gloss_color))
+        canvas.alpha_composite(frame, ((side-frame.width)//2, int(side*.84)-frame.height))
         if flash_step:
             alpha = canvas.getchannel('A')
             tinted = Image.blend(canvas.convert('RGB'), Image.new('RGB', canvas.size, color), flash_step/32)
@@ -730,7 +758,7 @@ class SpriteWindow:
                 owner=user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
                 setlong(hwnd,-8,owner)
             except Exception: pass
-        text=f'BPM {round(self.app.bpm_notice_value)}'
+        text=self.app.notice_message or f'BPM {round(self.app.bpm_notice_value)}'
         key=(text,self.size,self.app.notice_color,self.app.notice_outline.get(),self.app.notice_outline_color)
         if key != self.notice_render_key:
             fontsize=max(16,min(36,self.size//12))
@@ -792,10 +820,14 @@ class App:
         if isinstance(self.config.get('windows'),list):
             for record in self.config['windows']:
                 if isinstance(record,dict): record['image']=migrate(record.get('image',''))
-        geometry = self.config.get('main_geometry', '760x850')
-        self.root.geometry(geometry if isinstance(geometry,str) and re.fullmatch(r'\d{3,4}x\d{3,4}',geometry) else '760x850')
-        self.root.minsize(610,610)
-        self.root.resizable(True,True)
+        geometry=self.config.get('main_geometry','760x850')
+        if not isinstance(geometry,str) or not re.fullmatch(r'\d{3,4}x\d{3,4}',geometry): geometry='760x850'
+        width,height=map(int,geometry.split('x'))
+        self.main_size=(max(610,width),max(610,min(height,self.root.winfo_screenheight()-90)))
+        self.root.geometry(f'{self.main_size[0]}x{self.main_size[1]}')
+        self.root.minsize(self.main_size[0],610)
+        self.root.maxsize(self.main_size[0],self.root.winfo_screenheight())
+        self.root.resizable(False,True)
         self.events = queue.Queue()
         self.analyzer = None
         self.tray = None
@@ -839,12 +871,15 @@ class App:
         self.tick_job = None
         self.flash_started = -1e9
         self.bpm_notice_started = -1e9; self.bpm_notice_value = 0
+        self.notice_message=''
+        self.last_music_seen=-1e9; self.visual_state='waiting'
+        self.gloss_started=-1e9; self.gloss_requested=False
+        self.shortcuts=dict(DEFAULTS)
         self.update_busy = False; self.update_release = None; self.update_progress_window = None; self.update_control = None
         self.setup_install = os.path.isfile(os.path.join(BASE,'.bounce-installed'))
         self.shared_image_path = self.config.get('image','')
         self.shared_original = self.get_image(self.shared_image_path)
         self.source_mode = tk.StringVar(value='process' if process_capture_supported() else 'device')
-        self.filter_text = tk.StringVar()
         self.image_mode = tk.StringVar(value=self.config.get('image_mode','uniform'))
         if self.image_mode.get() not in ('uniform','multiple'):
             self.image_mode.set('uniform')
@@ -878,6 +913,13 @@ class App:
         self.theme_mode = tk.StringVar(value=self.config.get('theme_mode','light'))
         if self.theme_mode.get() not in ('light','dark'): self.theme_mode.set('light')
         self.notice_duration = tk.DoubleVar(value=max(1.,min(6.,float(self.config.get('notice_duration',3.)))))
+        self.waiting_enabled=tk.BooleanVar(value=self.config.get('waiting_enabled',True))
+        self.waiting_frequency=tk.DoubleVar(value=max(.2,min(2.,float(self.config.get('waiting_frequency',.5)))))
+        self.gloss_enabled=tk.BooleanVar(value=self.config.get('gloss_enabled',True))
+        self.gloss_duration=tk.DoubleVar(value=max(.15,min(1.5,float(self.config.get('gloss_duration',.45)))))
+        for name,default in (('waiting_color','#ffffff'),('gloss_color','#ffffff')):
+            value=self.config.get(name,default)
+            setattr(self,name,value if isinstance(value,str) and re.fullmatch(r'#[0-9a-fA-F]{6}',value) else default)
         self.bpm_correction = tk.StringVar(value=self.config.get('bpm_correction','auto'))
         self.phase_correction = tk.StringVar(value=self.config.get('phase_correction','auto'))
         for variable in (self.bpm_correction,self.phase_correction):
@@ -912,8 +954,7 @@ class App:
         self.root.protocol('WM_DELETE_WINDOW',self.request_close)
         self.refresh_sources()
         self.make_tray()
-        width,height=map(int,(geometry if isinstance(geometry,str) and re.fullmatch(r'\d{3,4}x\d{3,4}',geometry) else '760x850').split('x'))
-        center_window(self.root,max(610,width),max(610,min(height,self.root.winfo_screenheight()-90))); self.root.deiconify()
+        center_window(self.root,*self.main_size); self.root.deiconify()
         self.tick()
 
     def apply_theme(self):
@@ -1018,6 +1059,19 @@ class App:
         self.update_loading_preview()
 
     def build_main(self):
+        footer=ttk.Frame(self.root,padding=(14,4,14,8)); footer.pack(side='bottom',fill='x')
+        self.runtime_footer=footer
+        ttk.Separator(footer).pack(fill='x',pady=(0,4))
+        ttk.Label(footer,text='运行信息').pack(anchor='w')
+        log_row=ttk.Frame(footer); log_row.pack(fill='x')
+        self.runtime_log=tk.Text(log_row,height=3,wrap='char',font=('Microsoft YaHei UI',9),state='disabled',
+                                 bd=0,highlightthickness=0,padx=6,pady=4)
+        log_bar=ttk.Scrollbar(log_row,orient='vertical',command=self.runtime_log.yview)
+        self.runtime_log.configure(yscrollcommand=log_bar.set)
+        log_bar.pack(side='right',fill='y'); self.runtime_log.pack(side='left',fill='x',expand=True)
+        self.last_status_message=None
+        self.status.trace_add('write',lambda *_:self.update_runtime_log())
+        self.update_runtime_log()
         container=ttk.Frame(self.root); container.pack(fill='both',expand=True)
         self.main_canvas=tk.Canvas(container,highlightthickness=0,bd=0)
         bar=ttk.Scrollbar(container,orient='vertical',command=self.main_canvas.yview)
@@ -1028,7 +1082,7 @@ class App:
         main.bind('<Configure>',lambda event:self.main_canvas.configure(scrollregion=self.main_canvas.bbox('all')))
         self.main_canvas.bind('<Configure>',lambda event:self.main_canvas.itemconfigure(content,width=event.width))
         def scroll(event):
-            if event.widget.winfo_toplevel()==self.root and not isinstance(event.widget,(tk.Scale,ttk.Scale,tk.Listbox,ttk.Combobox,ttk.Spinbox)):
+            if event.widget.winfo_toplevel()==self.root and not isinstance(event.widget,(tk.Scale,ttk.Scale,tk.Listbox,tk.Text,ttk.Combobox,ttk.Spinbox)):
                 if self.main_content.winfo_height()>self.main_canvas.winfo_height():
                     self.main_canvas.yview_scroll(-int(event.delta/120),'units')
         self.root.bind('<MouseWheel>',scroll,add='+')
@@ -1045,11 +1099,7 @@ class App:
         netease_button=ttk.Button(row,text='自动查找播放进程',command=self.find_playing_process)
         netease_button.pack(side='right')
         if not process_capture_supported(): netease_button.state(['disabled'])
-        row=ttk.Frame(audio); row.pack(fill='x',pady=5)
-        ttk.Label(row,text='筛选进程').pack(side='left')
-        ttk.Entry(row,textvariable=self.filter_text).pack(side='left',fill='x',expand=True,padx=8)
-        self.filter_text.trace_add('write',lambda *_: self.apply_filter())
-        row=ttk.Frame(audio); row.pack(fill='x')
+        row=ttk.Frame(audio); row.pack(fill='x',pady=(5,0))
         self.combo=ttk.Combobox(row,state='readonly'); self.combo.pack(side='left',fill='x',expand=True)
         ttk.Button(row,text='刷新列表',command=self.refresh_sources).pack(side='left',padx=(7,0))
         row=ttk.Frame(audio); row.pack(fill='x',pady=(7,0))
@@ -1063,7 +1113,6 @@ class App:
         self.bpm_double_button.pack(side='left',padx=(0,4))
         self.bpm_half_button=ttk.Button(row,text='÷2',width=4,command=lambda:self.scale_bpm(.5))
         self.bpm_half_button.pack(side='left')
-        ttk.Label(row,text='不学习',foreground='#666666').pack(side='left',padx=6)
         ttk.Button(row,text='立即对齐节奏',command=self.realign_rhythm).pack(side='right')
         ttk.Button(row,text='刷新 BPM',command=self.refresh_bpm).pack(side='right',padx=6)
         row=ttk.Frame(rhythm); row.pack(fill='x',pady=(0,5))
@@ -1078,8 +1127,8 @@ class App:
         self.manual_unlock_button.pack(side='left'); self.manual_unlock_button.state(['disabled'])
         row=ttk.Frame(rhythm); row.pack(fill='x')
         ttk.Label(row,text='本曲节奏微调',width=12).pack(side='left')
-        ttk.Button(row,text='提前一点',command=lambda:self.adjust_offset(-.02)).pack(side='left')
-        ttk.Button(row,text='延后一点',command=lambda:self.adjust_offset(.02)).pack(side='left',padx=6)
+        ttk.Button(row,text='延后一点',command=lambda:self.adjust_offset(.02)).pack(side='left')
+        ttk.Button(row,text='提前一点',command=lambda:self.adjust_offset(-.02)).pack(side='left',padx=6)
         ttk.Button(row,text='恢复自动',command=self.reset_alignment).pack(side='left')
         ttk.Label(row,textvariable=self.offset_label).pack(side='left',padx=9)
         pictures=ttk.LabelFrame(main,text='图片窗口',padding=(12,7)); pictures.pack(fill='x',pady=4)
@@ -1115,7 +1164,7 @@ class App:
         row=ttk.Frame(animation); row.pack(fill='x',pady=(0,5))
         ttk.Checkbutton(row,text='水平翻转动画',variable=self.horizontal_flip,command=self.save).pack(side='left')
         ttk.Label(row,text='（歌曲节奏复杂时不建议启用）',foreground='#666666').pack(side='left',padx=6)
-        self.flip_shift_button=ttk.Button(row,text='切换翻转拍位',width=13,command=self.shift_flip_beat)
+        self.flip_shift_button=ttk.Button(row,text='快进一拍',width=11,command=self.shift_flip_beat)
         self.flip_shift_button.pack(side='right'); self.flip_shift_button.state(['disabled'])
         row=ttk.Frame(animation); row.pack(fill='x')
         ttk.Label(row,text='翻转 BPM 阈值',width=16).pack(side='left')
@@ -1123,15 +1172,25 @@ class App:
                     state='readonly',command=self.save).pack(side='left')
         ttk.Label(row,text='BPM 及以上：压扁两次再翻转',foreground='#666666').pack(side='left',padx=8)
         ttk.Checkbutton(main,text='歌曲结束后询问节奏与 BPM 是否匹配（用于校准分析）',variable=self.feedback_enabled,command=self.save).pack(anchor='w',pady=(2,3))
-        status_label=ttk.Label(main,textvariable=self.status,wraplength=600,foreground='#34596a')
-        status_label.pack(anchor='w',pady=(3,0))
-        main.bind('<Configure>',lambda event:status_label.configure(wraplength=max(300,event.width-28)),add='+')
 
-    def color_swatch(self,parent,color,command):
+    def update_runtime_log(self):
+        if not hasattr(self,'runtime_log') or not self.runtime_log.winfo_exists(): return
+        message=self.status.get()
+        if not message or message==self.last_status_message: return
+        self.last_status_message=message
+        self.runtime_log.configure(state='normal')
+        self.runtime_log.insert('end',time.strftime('%H:%M:%S')+'  '+message+'\n')
+        lines=int(self.runtime_log.index('end-1c').split('.')[0])
+        if lines>100: self.runtime_log.delete('1.0',f'{lines-100}.0')
+        self.runtime_log.configure(state='disabled'); self.runtime_log.see('end')
+
+    def color_swatch(self,parent,color,command,enabled=None):
         swatch=tk.Label(parent,bg=color,width=4,height=1,relief='solid',bd=1,cursor='hand2',takefocus=True)
-        swatch.bind('<Button-1>',lambda event:command())
-        swatch.bind('<Return>',lambda event:command())
-        swatch.bind('<space>',lambda event:command())
+        def choose(event):
+            if enabled is None or enabled.get(): command()
+        swatch.bind('<Button-1>',choose)
+        swatch.bind('<Return>',choose)
+        swatch.bind('<space>',choose)
         swatch.pack(side='left',padx=8)
         return swatch
 
@@ -1143,8 +1202,20 @@ class App:
         set_window_icon(window)
         window.title('Q弹音乐 · 设置'); window.resizable(False,False)
         notebook=ttk.Notebook(window); notebook.pack(fill='both',expand=True,padx=12,pady=12)
-        general=ttk.Frame(notebook,padding=14); feature=ttk.Frame(notebook,padding=14); about=ttk.Frame(notebook,padding=18)
-        notebook.add(general,text='常规'); notebook.add(feature,text='功能'); notebook.add(about,text='关于')
+        general=ttk.Frame(notebook,padding=14); feature_page=ttk.Frame(notebook); about=ttk.Frame(notebook,padding=18)
+        notebook.add(general,text='常规'); notebook.add(feature_page,text='功能'); notebook.add(about,text='关于')
+        effect_canvas=tk.Canvas(feature_page,width=520,height=min(580,self.root.winfo_screenheight()-180),highlightthickness=0)
+        effect_bar=ttk.Scrollbar(feature_page,orient='vertical',command=effect_canvas.yview)
+        effect_canvas.configure(yscrollcommand=effect_bar.set)
+        effect_bar.pack(side='right',fill='y'); effect_canvas.pack(side='left',fill='both',expand=True)
+        feature=ttk.Frame(effect_canvas,padding=14)
+        feature_id=effect_canvas.create_window((0,0),window=feature,anchor='nw')
+        feature.bind('<Configure>',lambda event:effect_canvas.configure(scrollregion=effect_canvas.bbox('all')))
+        effect_canvas.bind('<Configure>',lambda event:effect_canvas.itemconfigure(feature_id,width=event.width))
+        def scroll_effects(event):
+            if notebook.index('current')==1 and not isinstance(event.widget,(tk.Scale,ttk.Combobox)):
+                effect_canvas.yview_scroll(-int(event.delta/120),'units')
+        window.bind('<MouseWheel>',scroll_effects,add='+')
         self.settings_notebook=notebook
         row=ttk.Frame(general); row.pack(fill='x',pady=6)
         ttk.Label(row,text='动画帧率',width=18).pack(side='left')
@@ -1190,16 +1261,38 @@ class App:
                  showvalue=False,highlightthickness=0,command=lambda value:self.save()).pack(side='left',padx=6)
         ttk.Label(row,textvariable=self.flash_duration,width=4).pack(side='left'); ttk.Label(row,text='秒').pack(side='left')
         row=ttk.Frame(feature); row.pack(fill='x',pady=3)
-        ttk.Checkbutton(row,text='锁定时显示 BPM 浮动文字',variable=self.notice_enabled,command=self.save).pack(side='left')
-        self.notice_preview=self.color_swatch(row,self.notice_color,self.choose_notice_color)
-        row=ttk.Frame(feature); row.pack(fill='x',pady=2)
+        ttk.Checkbutton(row,text='启用浮动文字',variable=self.notice_enabled,command=self.set_notice_enabled).pack(side='left')
+        self.notice_options=ttk.Frame(feature); self.notice_options.pack(fill='x')
+        row=ttk.Frame(self.notice_options); row.pack(fill='x',pady=2)
+        ttk.Label(row,text='文字颜色',width=16).pack(side='left')
+        self.notice_preview=self.color_swatch(row,self.notice_color,self.choose_notice_color,self.notice_enabled)
+        row=ttk.Frame(self.notice_options); row.pack(fill='x',pady=2)
         ttk.Checkbutton(row,text='文字描边',variable=self.notice_outline,command=self.save).pack(side='left')
-        self.outline_preview=self.color_swatch(row,self.notice_outline_color,self.choose_outline_color)
-        row=ttk.Frame(feature); row.pack(fill='x')
+        self.outline_preview=self.color_swatch(row,self.notice_outline_color,self.choose_outline_color,self.notice_enabled)
+        row=ttk.Frame(self.notice_options); row.pack(fill='x')
         ttk.Label(row,text='文字显示时长',width=16).pack(side='left')
         tk.Scale(row,variable=self.notice_duration,from_=1,to=6,resolution=.25,orient='horizontal',length=190,
                  showvalue=False,highlightthickness=0,command=lambda value:self.save()).pack(side='left',padx=6)
         ttk.Label(row,textvariable=self.notice_duration,width=4).pack(side='left'); ttk.Label(row,text='秒').pack(side='left')
+        self.set_notice_enabled(save=False)
+        ttk.Separator(feature).pack(fill='x',pady=7)
+        row=ttk.Frame(feature); row.pack(fill='x',pady=3)
+        ttk.Checkbutton(row,text='等待播放时呼吸闪烁',variable=self.waiting_enabled,command=self.save).pack(side='left')
+        self.waiting_preview=self.color_swatch(row,self.waiting_color,lambda:self.choose_effect_color('waiting_color','waiting_preview','选择等待闪烁颜色'))
+        row=ttk.Frame(feature); row.pack(fill='x')
+        ttk.Label(row,text='呼吸频率',width=16).pack(side='left')
+        tk.Scale(row,variable=self.waiting_frequency,from_=.2,to=2.,resolution=.1,orient='horizontal',length=190,
+                 showvalue=False,highlightthickness=0,command=lambda value:self.save()).pack(side='left',padx=6)
+        ttk.Label(row,textvariable=self.waiting_frequency,width=4).pack(side='left'); ttk.Label(row,text='次/秒').pack(side='left')
+        row=ttk.Frame(feature); row.pack(fill='x',pady=(6,3))
+        ttk.Checkbutton(row,text='快捷对齐时显示光泽',variable=self.gloss_enabled,command=self.save).pack(side='left')
+        self.gloss_preview=self.color_swatch(row,self.gloss_color,lambda:self.choose_effect_color('gloss_color','gloss_preview','选择对齐光泽颜色'))
+        row=ttk.Frame(feature); row.pack(fill='x')
+        ttk.Label(row,text='光泽划过时间',width=16).pack(side='left')
+        tk.Scale(row,variable=self.gloss_duration,from_=.15,to=1.5,resolution=.05,orient='horizontal',length=190,
+                 showvalue=False,highlightthickness=0,command=lambda value:self.save()).pack(side='left',padx=6)
+        ttk.Label(row,textvariable=self.gloss_duration,width=4).pack(side='left'); ttk.Label(row,text='秒').pack(side='left')
+        ttk.Label(feature,text='光泽时间越短，划过速度越快。',foreground='#666666').pack(anchor='w',pady=3)
         ttk.Separator(feature).pack(fill='x',pady=7)
         row=ttk.Frame(feature); row.pack(fill='x')
         ttk.Label(row,text='加载动图位置').pack(side='left')
@@ -1230,7 +1323,7 @@ class App:
         ttk.Label(about,textvariable=self.update_status,wraplength=440).pack(anchor='w')
         window.protocol('WM_DELETE_WINDOW',lambda: (self.save(),window.withdraw()))
         self.apply_theme()
-        center_window(window,540); window.deiconify(); window.attributes('-topmost',True); window.lift()
+        center_window(window,600); window.deiconify(); window.attributes('-topmost',True); window.lift()
 
     def request_close(self):
         action=self.close_action.get()
@@ -1569,26 +1662,40 @@ class App:
             self.status.set('已重新开始 BPM 和对轨分析。')
         else:
             self.status.set('请先开始监听音频，再刷新 BPM。')
-    def realign_rhythm(self):
+    def realign_rhythm(self,gloss=False):
         if not self.analyzer or not self.analyzer.is_playing() or not self.analyzer.values()[0]:
-            self.status.set('请先播放音乐并等待 BPM 识别完成。'); return
+            self.status.set('请先播放音乐并等待 BPM 识别完成。'); return False
         self.analyzer.realign()
+        self.gloss_requested=bool(gloss)
         self.flip_anchor=None
         self.reset_flip_timing()
         self.status.set('正在根据近期鼓点重新对齐节奏……')
+        return True
+
+    def emit_notice(self,text):
+        if self.notice_enabled.get():
+            self.notice_message=text; self.bpm_notice_started=time.monotonic()
+
+    def run_shortcut(self,action):
+        if action=='align': self.realign_rhythm(gloss=True)
+        elif action in ('earlier','later','auto'):
+            if action=='auto': self.reset_alignment()
+            else: self.adjust_offset(-.02 if action=='earlier' else .02)
+            self.emit_notice(self.offset_label.get())
+
     def reset_flip_timing(self):
-        pending=self.flip_shift_pending
         self.flip_pair_offset=0; self.flip_face_bias=0; self.flip_shift_pending=False; self.flip_last_index=None
-        if pending and hasattr(self,'flip_shift_button'): self.flip_shift_button.config(text='切换翻转拍位')
+    def toggle_flip(self):
+        self.horizontal_flip.set(not self.horizontal_flip.get())
+        self.reset_flip_timing(); self.save()
     def shift_flip_beat(self):
         if not self.horizontal_flip.get() or not self.analyzer or not self.analyzer.is_playing():
             self.status.set('请先启用水平翻转，并播放音乐。'); return
         bpm,_,beat,_,_=self.analyzer.values()
         if not beat or bpm<self.flip_bpm_threshold.get():
             self.status.set('达到翻转 BPM 阈值后，才需要切换两次压扁的翻转拍位。'); return
-        self.flip_shift_pending=not self.flip_shift_pending
-        self.flip_shift_button.config(text='取消切换' if self.flip_shift_pending else '切换翻转拍位')
-        self.status.set('将在下一次压扁时将翻转分组错开一拍，不改变 BPM。' if self.flip_shift_pending else '已取消本次翻转拍位切换。')
+        self.flip_shift_pending+=1
+        self.status.set(f'翻转已请求快进 {self.flip_shift_pending} 拍，将在下一次压扁时生效。')
     def scale_bpm(self,factor):
         if not self.analyzer or not self.analyzer.is_playing():
             self.status.set('请先播放音乐并等待 BPM 识别完成。'); return
@@ -1677,6 +1784,20 @@ class App:
         _,chosen=colorchooser.askcolor(color=self.notice_color,parent=self.settings_window,title='选择 BPM 文字颜色')
         if chosen:
             self.notice_color=chosen; self.notice_preview.config(bg=chosen); self.save()
+    def set_notice_enabled(self,save=True):
+        if hasattr(self,'notice_options') and self.notice_options.winfo_exists():
+            enabled=self.notice_enabled.get()
+            def apply(widget):
+                if isinstance(widget,tk.Scale): widget.configure(state='normal' if enabled else 'disabled')
+                elif isinstance(widget,ttk.Checkbutton): widget.state(['!disabled'] if enabled else ['disabled'])
+                elif isinstance(widget,tk.Label): widget.configure(cursor='hand2' if enabled else 'arrow')
+                for child in widget.winfo_children(): apply(child)
+            apply(self.notice_options)
+        if save: self.save()
+    def choose_effect_color(self,attribute,preview,title):
+        _,chosen=colorchooser.askcolor(color=getattr(self,attribute),parent=self.settings_window,title=title)
+        if chosen:
+            setattr(self,attribute,chosen); getattr(self,preview).configure(bg=chosen); self.save()
     def choose_outline_color(self):
         _,chosen=colorchooser.askcolor(color=self.notice_outline_color,parent=self.settings_window,title='选择 BPM 文字描边颜色')
         if chosen:
@@ -1762,7 +1883,7 @@ class App:
     def find_playing_process(self):
         if not process_capture_supported():
             self.status.set('此版 Windows 10 请使用播放设备监听。'); return
-        self.source_mode.set('process'); self.filter_text.set(''); self.refresh_sources()
+        self.source_mode.set('process'); self.refresh_sources()
         self.status.set('正在检测播放设备上的活动音频进程，请保持音乐播放……')
         def worker():
             totals={}; taps=[]
@@ -1804,13 +1925,12 @@ class App:
     def refresh_sources(self):
         try:
             self.all_sources=processes() if self.source_mode.get()=='process' else devices()
-            self.apply_filter()
+            self.populate_sources()
         except Exception as error: self.status.set('获取音频源失败：'+str(error))
-    def apply_filter(self):
+    def populate_sources(self):
         if not hasattr(self,'combo'): return
         if self.source_mode.get()=='process':
-            key=self.filter_text.get().strip().lower()
-            self.sources=[p for p in self.all_sources if key in p[1].lower() or key in str(p[0])]
+            self.sources=list(self.all_sources)
             self.combo['values']=[f'{name}   (PID {pid})' for pid,name in self.sources]
             wanted=self.config.get('process','')
             index=next((i for i,(_,name) in enumerate(self.sources) if name.lower()==wanted.lower()),0)
@@ -1819,7 +1939,7 @@ class App:
             wanted=self.config.get('device','')
             index=next((i for i,d in enumerate(self.sources) if d[1]==wanted),0)
         if self.sources: self.combo.current(index)
-        else: self.combo.set(''); self.status.set('没有匹配的音频源，请打开音乐软件或清除筛选后刷新。')
+        else: self.combo.set(''); self.status.set('没有可用的音频源，请打开音乐软件后刷新。')
     def start(self):
         if self.source_mode.get()=='process' and not process_capture_supported():
             self.source_mode.set('device'); self.refresh_sources()
@@ -1833,6 +1953,7 @@ class App:
         self.config['process' if mode=='process' else 'device']=source[1]
         self.save()
     def stop(self):
+        self.last_music_seen=-1e9; self.gloss_requested=False; self.gloss_started=-1e9
         if self.analyzer: self.analyzer.stop(); self.analyzer=None
         self.clear_manual_bpm()
         self.offset.set(0.); self.offset_label.set('自动对齐')
@@ -1897,6 +2018,8 @@ class App:
                 flash_duration=self.flash_duration.get(), close_action=self.close_action.get(),
                 notice_enabled=self.notice_enabled.get(), notice_color=self.notice_color, notice_duration=self.notice_duration.get(),
                 notice_outline=self.notice_outline.get(), notice_outline_color=self.notice_outline_color, theme_mode=self.theme_mode.get(),
+                waiting_enabled=self.waiting_enabled.get(),waiting_frequency=self.waiting_frequency.get(),waiting_color=self.waiting_color,
+                gloss_enabled=self.gloss_enabled.get(),gloss_duration=self.gloss_duration.get(),gloss_color=self.gloss_color,
                 bpm_correction=self.bpm_correction.get(), phase_correction=self.phase_correction.get())
             self.config['recent_images']=self.recent_images
             with open(CONFIG,'w',encoding='utf-8') as file:
@@ -1927,7 +2050,7 @@ class App:
                 elif kind=='found_process':
                     pid,power=value
                     if self.source_mode.get()=='process' and power>1e-9:
-                        self.filter_text.set(''); self.refresh_sources()
+                        self.refresh_sources()
                         index=next((i for i,p in enumerate(self.sources) if p[0]==pid),-1)
                         if index>=0: self.combo.current(index); self.status.set('已找到有声音的进程，请确认来源并点击开始监听。')
                         else: self.status.set('播放进程已变化，请重新查找。')
@@ -1943,9 +2066,11 @@ class App:
                 elif kind=='manual_unlock': self.clear_manual_bpm()
                 elif kind=='bpm_locked':
                     if self.flash_enabled.get(): self.flash_started=time.monotonic()
-                    if self.notice_enabled.get():
-                        self.bpm_notice_started=time.monotonic(); self.bpm_notice_value=value
+                    self.bpm_notice_value=value; self.emit_notice(f'BPM {round(value)}')
                     self.status.set('BPM 已锁定：'+str(round(value)))
+                elif kind=='rhythm_aligned':
+                    if value and self.gloss_requested and self.gloss_enabled.get(): self.gloss_started=time.monotonic()
+                    self.gloss_requested=False
                 elif kind=='update_checked':
                     self.update_busy=False
                     try:
@@ -1966,16 +2091,22 @@ class App:
                         self.save(); updater.launch_updater(value,BASE,os.getpid(),self.setup_install); self.quit(); return
                     except Exception as error: self.update_status.set('无法启动更新：'+str(error))
                 elif kind=='status': self.status.set(value)
-                elif kind=='error': self.status.set(value); self.bpmtext.set('BPM：--')
+                elif kind=='error': self.status.set(value); self.bpmtext.set('BPM：--'); self.gloss_requested=False
         except queue.Empty: pass
         bpm,level,beat,shape,strength=self.analyzer.values() if self.analyzer else (0,0,0,.12,.8)
         playing=bool(self.analyzer and self.analyzer.is_playing())
-        self.bpmtext.set('BPM：'+(str(round(bpm)) if bpm and playing else ('分析中' if playing else ('等待播放' if self.analyzer else '--'))))
+        self.bpmtext.set('BPM：'+(str(round(bpm)) if bpm and playing else ('分析中' if playing else '等待播放')))
         current=getattr(self.analyzer,'manual_bpm',0.) or bpm
         for button,factor in ((self.bpm_double_button,2.),(self.bpm_half_button,.5)):
             button.state(['!disabled'] if playing and current and 40<=current*factor<=300 else ['disabled'])
         self.flip_shift_button.state(['!disabled'] if playing and beat and self.horizontal_flip.get() and bpm>=self.flip_bpm_threshold.get() else ['disabled'])
         now=time.monotonic(); dt=min(.2,max(.001,now-self.last_frame_time)); self.last_frame_time=now
+        if playing: self.last_music_seen=now
+        waiting=not playing and now-self.last_music_seen>.6
+        self.visual_state='waiting' if waiting else ('analyzing' if playing and not bpm else 'playing')
+        self.idle_step=breathing_step(now,self.waiting_frequency.get()) if waiting and self.waiting_enabled.get() else -1
+        gloss_age=now-self.gloss_started; gloss_duration=self.gloss_duration.get()
+        self.shine_step=round(gloss_age/gloss_duration*64) if self.gloss_enabled.get() and 0<=gloss_age<gloss_duration else -1
         active=bool(playing and level>.002 and beat)
         amp=animation_amplitude(self.amplitude.get()) if active else 0.
         # The squash reaches its peak after its attack; predict the grid to center it on the beat.
@@ -2014,11 +2145,10 @@ class App:
             # A delayed UI frame cannot lose a beat; manual realignment reanchors the pair.
             index=max(0,round((event_time-shift-origin)/period))
             if active and self.flip_shift_pending and self.flip_last_index is not None and index!=self.flip_last_index:
-                changed=1-self.flip_pair_offset
+                steps=self.flip_shift_pending; changed=(self.flip_pair_offset+steps)%2
                 self.flip_face_bias=((index+self.flip_pair_offset)//cadence+self.flip_face_bias-(index+changed)//cadence)%2
                 self.flip_pair_offset=changed; self.flip_shift_pending=False
-                self.flip_shift_button.config(text='切换翻转拍位')
-                self.status.set('翻转分组已错开一拍。立即对齐节奏可恢复自动分组。' if changed else '已恢复默认翻转拍位。')
+                self.status.set(f'翻转已快进 {steps} 拍。立即对齐节奏可恢复自动分组。')
             self.flip_last_index=index
             effective=index+self.flip_pair_offset+cadence*self.flip_face_bias
             self.flip_cadence=cadence; self.flip_squash_count=(index+self.flip_pair_offset+1)%cadence
@@ -2029,7 +2159,7 @@ class App:
         loading_index=self.loading_frame_index(now) if playing and not bpm else -1
         self.frame_cache={}
         for sprite in self.sprites:
-            sprite.render(self.anim_sx,self.anim_sy,flash,color,loading_index,self.flip_angle)
+            sprite.render(self.anim_sx,self.anim_sy,flash,color,loading_index,self.flip_angle,self.idle_step,self.shine_step)
             sprite.update_notice(now)
         if self.settings_window and self.settings_window.winfo_exists() and self.settings_window.winfo_viewable():
             self.update_loading_preview()

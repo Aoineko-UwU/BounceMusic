@@ -43,7 +43,7 @@ class TextExtractor(html.parser.HTMLParser):
     def handle_starttag(self, tag, attrs):
         if tag in ('p','li','h1','h2','h3','br'): self.parts.append('\n')
     def handle_data(self, data): self.parts.append(data)
-    def text(self): return ''.join(self.parts).strip()
+    def text(self): return re.sub(r'\n[ \t]*(?:\n[ \t]*)+','\n\n',''.join(self.parts)).strip()
 
 class AssetExtractor(html.parser.HTMLParser):
     def __init__(self, name):

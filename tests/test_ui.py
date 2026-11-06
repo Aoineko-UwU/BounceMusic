@@ -37,8 +37,9 @@ def test_window_and_image_flow():
         with patch.object(module, 'CONFIG', config), patch.object(module.App, 'make_tray'), patch.object(module.App, 'refresh_sources'):
             application = module.App()
             try:
-                assert application.root.resizable() == (1, 1)
-                assert application.root.minsize() == (610, 610)
+                assert application.root.resizable() == (0, 1)
+                assert application.root.minsize() == (application.main_size[0],610)
+                assert not find_label(application.root,'筛选进程')
                 assert Path(module.APP_ICON).is_file()
                 assert application.amplitude.get() == 100.
                 assert module.animation_amplitude(100) == 1.25
@@ -51,10 +52,21 @@ def test_window_and_image_flow():
                 assert module.flip_projection(180)[1] is True
                 application.root.geometry('800x720')
                 application.root.update()
+                assert application.root.winfo_width()==application.main_size[0]
+                footer_y=application.runtime_footer.winfo_rooty()
                 application.main_canvas.yview_moveto(1); application.root.update()
+                assert application.runtime_footer.winfo_rooty()==footer_y
+                assert application.runtime_footer.winfo_rooty()+application.runtime_footer.winfo_height()<=application.root.winfo_rooty()+application.root.winfo_height()
+                application.status.set('固定栏测试信息')
+                assert '固定栏测试信息' in application.runtime_log.get('1.0','end')
                 threshold=find_label(application.root,'翻转 BPM 阈值')
                 assert threshold.winfo_rooty()<application.root.winfo_rooty()+application.root.winfo_height()
                 application.main_canvas.yview_moveto(0); application.root.update()
+                application.root.geometry(f'{application.main_size[0]}x610'); application.root.update()
+                assert application.runtime_footer.winfo_rooty()+application.runtime_footer.winfo_height()<=application.root.winfo_rooty()+610
+                application.root.geometry(f'{application.main_size[0]}x720'); application.root.update()
+                offset_row=find_label(application.root,'本曲节奏微调').master
+                assert [child.cget('text') for child in offset_row.winfo_children() if isinstance(child,module.ttk.Button)][:2]==['延后一点','提前一点']
                 for name in ('动画幅度',):
                     label=find_label(application.root,name)
                     scale=next(child for child in label.master.winfo_children() if isinstance(child,module.tk.Scale))
@@ -248,7 +260,7 @@ def test_window_and_image_flow():
                 assert second not in application.sprites
                 application.save()
                 saved=json.loads(Path(config).read_text(encoding='utf-8'))
-                assert saved['main_geometry'] == '800x720'
+                assert saved['main_geometry'] == f'{application.main_size[0]}x720'
                 assert saved['amplitude_scale_version'] == 2
             finally:
                 application.quit()
@@ -474,11 +486,93 @@ def test_horizontal_flip_alternates_on_beats():
                 application.realign_rhythm()
                 assert application.flip_pair_offset==0 and application.flip_face_bias==0
                 assert not application.flip_shift_pending and 'bpm_examples' not in application.config
+                step(1006.45,1006.,120.)
+                application.shift_flip_beat(); application.shift_flip_beat()
+                assert application.flip_shift_pending==2 and application.flip_shift_button.cget('text')=='快进一拍'
+                step(1006.95,1006.5,120.)
+                assert not application.flip_shift_pending and application.flip_pair_offset==0
                 application.flip_bpm_threshold.set(130); application.save()
                 assert json.loads(Path(module.CONFIG).read_text(encoding='utf-8'))['flip_bpm_threshold']==130
             finally:
                 application.analyzer=None
                 application.quit()
+
+def test_waiting_gloss_and_mouse_shortcuts():
+    with tempfile.TemporaryDirectory() as directory:
+        with patch.object(module,'CONFIG',str(Path(directory)/'设置.json')),patch.object(module.App,'make_tray'),patch.object(module.App,'refresh_sources'):
+            application=module.App()
+            try:
+                class Player:
+                    bpm=0.; playing=False; aligned=0
+                    def values(self): return self.bpm,.2,10.,.12,1.
+                    def is_playing(self): return self.playing
+                    def realign(self): self.aligned+=1
+                player=Player(); application.analyzer=player
+                def tick(now):
+                    application.root.after_cancel(application.tick_job)
+                    with patch.object(module.time,'monotonic',return_value=now): application.tick()
+                tick(1000.)
+                assert application.visual_state=='waiting' and application.idle_step>=0
+                assert application.sprites[0].render_key[-1]==-1
+                player.playing=True; tick(1001.)
+                assert application.visual_state=='analyzing' and application.idle_step==-1
+                assert application.sprites[0].render_key[-1]>=0
+                player.bpm=120.; tick(1002.)
+                assert application.visual_state=='playing' and application.idle_step==-1
+                assert application.sprites[0].render_key[-1]==-1
+                sprite=application.sprites[0]
+                def click(number,state=0):
+                    return sprite.mouse_down(SimpleNamespace(num=number,state=state,x_root=100,y_root=100))
+                with patch.object(sprite,'context_menu') as context:
+                    click(1,1)
+                    assert application.offset.get()==-.02 and player.aligned==0 and sprite.drag is None
+                    assert application.notice_message==application.offset_label.get()
+                    click(3,1)
+                    assert application.offset.get()==0. and application.notice_message=='自动对齐'
+                    context.assert_not_called()
+                application.adjust_offset(.04); click(2,1)
+                assert application.offset.get()==0. and player.aligned==1
+                assert application.notice_message=='自动对齐' and not application.gloss_requested
+                click(2)
+                assert player.aligned==2 and application.gloss_requested
+                application.events.put(('rhythm_aligned',True)); tick(1002.1)
+                assert not application.gloss_requested and application.shine_step==0
+                tick(1002.3)
+                assert 0<application.shine_step<64
+                tick(1003.)
+                assert application.shine_step==-1
+                player.playing=False; tick(1003.7)
+                assert application.visual_state=='waiting' and application.idle_step>=0
+                menus=[]
+                with patch.object(module.tk.Menu,'tk_popup',lambda menu,*args:menus.append(menu)):
+                    sprite.context_menu(SimpleNamespace(x_root=100,y_root=100))
+                menu=menus[0]
+                labels=[menu.entrycget(i,'label') for i in range(menu.index('end')+1) if menu.type(i)=='command']
+                assert '节奏提前一点（Shift+鼠标左键）' in labels and '恢复自动（Shift+鼠标中键）' in labels
+                assert all('不学习' not in label for label in labels)
+                index=next(i for i in range(menu.index('end')+1) if menu.type(i)=='command' and menu.entrycget(i,'label')=='启用翻转动画')
+                menu.invoke(index); assert application.horizontal_flip.get()
+                application.toggle_flip(); assert not application.horizontal_flip.get()
+                application.show_settings(); application.root.update()
+                assert find_label(application.settings_window,'呼吸频率') and find_label(application.settings_window,'光泽划过时间')
+                application.settings_notebook.select(1); application.root.update()
+                application.notice_enabled.set(False); application.set_notice_enabled()
+                with patch.object(module.colorchooser,'askcolor') as chooser:
+                    application.notice_preview.event_generate('<Button-1>'); application.root.update()
+                    chooser.assert_not_called()
+                application.notice_enabled.set(True); application.set_notice_enabled()
+                application.waiting_frequency.set(.8); application.waiting_color='#55aaff'
+                application.gloss_duration.set(.7); application.gloss_color='#ffff00'; application.save()
+                saved=json.loads(Path(module.CONFIG).read_text(encoding='utf-8'))
+                assert saved['waiting_frequency']==.8 and saved['waiting_color']=='#55aaff'
+                assert saved['gloss_duration']==.7 and saved['gloss_color']=='#ffff00'
+                text=module.tk.Text(application.root)
+                module.render_release_notes(text,'本次更新\n1、简短内容\n\n下载与安装\n后面的内容\n更新记录\n历史内容')
+                assert '简短内容' in text.get('1.0','end') and '后面的内容' not in text.get('1.0','end')
+                text.destroy()
+            finally:
+                application.analyzer=None; application.quit()
+
 
 def test_old_image_migration():
     with tempfile.TemporaryDirectory() as directory:
@@ -529,4 +623,5 @@ if __name__ == '__main__':
     test_import_square_crop()
     test_multi_import_and_new_presets()
     test_horizontal_flip_alternates_on_beats()
+    test_waiting_gloss_and_mouse_shortcuts()
     print('UI checks passed.')
