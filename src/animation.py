@@ -5,13 +5,13 @@ import numpy as np
 from PIL import Image
 
 
-def flip_pose(index, age, attack, hold, release, cadence, style='flat'):
+def flip_pose(index, age, attack, hold, release, cadence, style='flat', direction=1):
     index=max(0,int(index)); cadence=max(1,int(cadence))
     before=index//cadence; after=(index+1)//cadence
-    start=180. if before%2 else 0.; end=180. if after%2 else 0.
+    start=180.*before; end=180.*after
     progress=max(0.,min(1.,(age-attack-hold)/max(.001,release)))
     eased=progress**3*(10.+progress*(-15.+6.*progress)) if style=='perspective' else progress*progress*(3.-2.*progress)
-    return start+(end-start)*eased
+    return (direction*(start+(end-start)*eased))%360.
 
 
 def flat_frame(source, width, height, angle):
@@ -68,7 +68,7 @@ def feedback_frame(frame, idle_step=-1, shine_step=-1, shine_color=(255,255,255)
     alpha=frame.getchannel('A'); rgb=frame.convert('RGB')
     if idle_step>=0:
         wave=max(0.,min(1.,idle_step/64.))
-        rgb=Image.blend(rgb,Image.new('RGB',rgb.size,'black'),.58*(1.-wave))
+        rgb=Image.blend(rgb,Image.new('RGB',rgb.size,'black'),.35*(1.-wave))
     if shine_step>=0:
         progress=max(0.,min(1.,shine_step/64.))
         width,height=rgb.size; band=max(12.,min(width,height)*.24)

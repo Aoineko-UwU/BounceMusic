@@ -30,9 +30,11 @@ PRESET_DIR = os.path.join(ASSET_BASE, 'assets', 'presets')
 PRESET_NAMES = ('凑企鹅', '焗雪梨', '糖猫', 'baka', 'doro', 'ksm')
 PRESET_IMAGES = {'preset:' + name: os.path.join(PRESET_DIR, name + '.png') for name in PRESET_NAMES}
 PRESET_OPTIONS = ('', 'preset:matou', *PRESET_IMAGES)
-VERSION = '1.8.1'
+VERSION = '1.8.2'
 AUTHOR = '葵猫猫'
 FLIP_STYLES = {'平面翻转':'flat', '3D 翻转':'perspective'}
+FLIP_DIRECTIONS = {'顺时针':'clockwise', '逆时针':'counterclockwise'}
+GOLD = '#ffd700'
 
 def color_rgb(value):
     return tuple(int(value[index:index+2],16) for index in (1,3,5))
@@ -423,6 +425,7 @@ class Analyzer:
         self.bpm_correction=bpm_correction; self.phase_correction=phase_correction
         self.examples=list(examples or [])
         self.manual_bpm=0.; self.last_audible=0.; self.auto_estimate=0.
+        self.playback_ended=False; self.has_started=False
         self.align_epoch=0
         self.media=MediaMonitor(source[1][1]) if source[0]=='process' and source[1][1].lower() in ('cloudmusic.exe','qqmusic.exe') else None
         self.running = True; self.bpm = 0.; self.level = 0.; self.lastbeat = 0.; self.phase = 0.; self.shape = .12; self.beat_strength = .8; self.lock = threading.Lock()
@@ -436,6 +439,8 @@ class Analyzer:
         with self.lock: return self.phase
     def is_playing(self):
         return bool(self.running and time.monotonic()-self.last_audible < .25)
+    def has_ended(self):
+        return self.playback_ended
     def lock_bpm(self, bpm):
         self.manual_bpm=float(bpm)
     def realign(self):
@@ -471,6 +476,7 @@ class Analyzer:
                 media=self.media.snapshot() if self.media else None
                 if media and media.get('track'):
                     if media_track and media['track'] != media_track:
+                        self.playback_ended=False; self.has_started=False
                         if tracker.bpm and not media_stopped: self.events.put(('song_end', self.auto_estimate or tracker.bpm))
                         self.events.put(('song_changed',None))
                         tracker=BeatTracker(rate,chunk,self.analysis_bias,self.fast_bpm_threshold,self.end_silence,self.octave_bias,examples=self.examples)
@@ -478,7 +484,9 @@ class Analyzer:
                         pending=np.empty(0,dtype=np.float32); song_end_reported=False; paused_at=0.; media_stopped=False
                     media_track=media['track']
                 state=media.get('state') if media else None
+                if state in ('playing','paused'): self.playback_ended=False
                 if state in ('paused','stopped'):
+                    self.playback_ended=state=='stopped'
                     if not paused_at: paused_at=time.monotonic()
                     if state=='stopped' and not media_stopped:
                         if tracker.bpm: self.events.put(('song_end',self.auto_estimate or tracker.bpm))
@@ -497,6 +505,7 @@ class Analyzer:
                     with self.lock: self.level=0
                     if state!='playing' and not ended_without_data and time.monotonic()-last_data_time > self.end_silence:
                         ended_without_data=True
+                        self.playback_ended=self.has_started
                         if tracker.bpm > 0 and not song_end_reported:
                             song_end_reported=True; self.events.put(('song_end', self.auto_estimate or tracker.bpm))
                         tracker=BeatTracker(rate,chunk,self.analysis_bias,self.fast_bpm_threshold,self.end_silence,self.octave_bias,examples=self.examples); pending=np.empty(0,dtype=np.float32)
@@ -532,10 +541,12 @@ class Analyzer:
                         tracker.manual_bpm=0.; tracker.tempo_candidates.clear(); tracker.last_tempo_check=0.
                     if tracker.last_signal and now-tracker.last_signal < .25:
                         self.last_audible=time.monotonic()
+                        self.has_started=True; self.playback_ended=False
                     old_bpm=tracker.bpm
                     bpm,level,beat,shape,song_end,beat_strength=tracker.feed(frame,now)
                     if tracker.last_signal and now-tracker.last_signal < .25:
                         self.last_audible=time.monotonic()
+                        self.has_started=True; self.playback_ended=False
                     with self.lock:
                         self.bpm,self.level,self.lastbeat,self.shape,self.beat_strength=bpm,level,beat,shape,beat_strength
                         self.phase=tracker.phase
@@ -543,11 +554,14 @@ class Analyzer:
                         self.auto_estimate=bpm
                         self.events.put(('bpm_locked', bpm))
                     if song_end and not song_end_reported:
+                        self.playback_ended=True
                         song_end_reported=True; self.events.put(('song_end', self.auto_estimate or tracker.ended_bpm))
                         self.manual_bpm=0.; self.last_audible=0.; self.auto_estimate=0.; self.events.put(('manual_unlock',None))
                     elif not song_end:
                         song_end_reported=False
-        except Exception as e: self.events.put(('error', '无法监听此音频源：' + str(e)))
+        except Exception as e:
+            self.playback_ended=False
+            self.events.put(('error', '无法监听此音频源：' + str(e)))
         finally:
             if tap:
                 try: tap.close()
@@ -678,6 +692,14 @@ class SpriteWindow:
         for title,value in FLIP_STYLES.items():
             styles.add_radiobutton(label=title,variable=self.app.flip_style,value=value,command=self.app.set_flip_style)
         menu.add_cascade(label='翻转样式',menu=styles)
+        directions=tk.Menu(menu,tearoff=False)
+        if self.app.theme_mode.get()=='dark':
+            directions.configure(bg='#30343d',fg='#f2f3f5',activebackground='#505866',activeforeground='#ffffff')
+        for title,value in FLIP_DIRECTIONS.items():
+            directions.add_radiobutton(label=title,variable=self.app.flip_direction,value=value,command=self.app.set_flip_direction)
+        menu.add_cascade(label='翻转方向',menu=directions)
+        menu.add_command(label='翻转动画快进一拍',command=self.app.shift_flip_beat,
+                         state='normal' if self.app.horizontal_flip.get() else 'disabled')
         menu.add_separator()
         menu.add_command(label='刷新 BPM', command=self.app.refresh_bpm)
         shortcut=BINDING_LABELS[self.app.shortcuts['align']]
@@ -883,7 +905,7 @@ class App:
         self.flash_started = -1e9
         self.bpm_notice_started = -1e9; self.bpm_notice_value = 0
         self.notice_message=''
-        self.last_music_seen=-1e9; self.visual_state='waiting'
+        self.song_finished=False; self.visual_state='waiting'
         self.gloss_started=-1e9; self.gloss_requested=False
         self.shortcuts=dict(DEFAULTS)
         self.update_busy = False; self.update_release = None; self.update_progress_window = None; self.update_control = None
@@ -907,6 +929,8 @@ class App:
         self.horizontal_flip = tk.BooleanVar(value=bool(self.config.get('horizontal_flip',False)))
         self.flip_style=tk.StringVar(value=self.config.get('flip_style','flat'))
         if self.flip_style.get() not in FLIP_STYLES.values(): self.flip_style.set('flat')
+        self.flip_direction=tk.StringVar(value=self.config.get('flip_direction','clockwise'))
+        if self.flip_direction.get() not in FLIP_DIRECTIONS.values(): self.flip_direction.set('clockwise')
         # Manual alignment is temporary for the current song; previous songs do not leak into the next one.
         self.offset = tk.DoubleVar(value=0.)
         self.offset_label=tk.StringVar(value='自动对齐')
@@ -914,13 +938,13 @@ class App:
         self.top_value = self.top.get()
         self.size = tk.IntVar(value=self.config.get('size',240))
         self.flash_enabled = tk.BooleanVar(value=self.config.get('flash_enabled',True))
-        self.flash_color = self.config.get('flash_color','#ffff00')
+        self.flash_color = self.config.get('flash_color',GOLD)
         if not isinstance(self.flash_color,str) or not re.fullmatch(r'#[0-9a-fA-F]{6}',self.flash_color):
-            self.flash_color='#ffff00'
+            self.flash_color=GOLD
         self.flash_duration = tk.DoubleVar(value=float(self.config.get('flash_duration',.55)))
         self.notice_enabled = tk.BooleanVar(value=self.config.get('notice_enabled',True))
-        self.notice_color = self.config.get('notice_color','#ffff00')
-        if not isinstance(self.notice_color,str) or not re.fullmatch(r'#[0-9a-fA-F]{6}',self.notice_color): self.notice_color='#ffff00'
+        self.notice_color = self.config.get('notice_color',GOLD)
+        if not isinstance(self.notice_color,str) or not re.fullmatch(r'#[0-9a-fA-F]{6}',self.notice_color): self.notice_color=GOLD
         self.notice_outline = tk.BooleanVar(value=self.config.get('notice_outline',True))
         self.notice_outline_color = self.config.get('notice_outline_color','#000000')
         if not isinstance(self.notice_outline_color,str) or not re.fullmatch(r'#[0-9a-fA-F]{6}',self.notice_outline_color): self.notice_outline_color='#000000'
@@ -928,11 +952,13 @@ class App:
         if self.theme_mode.get() not in ('light','dark'): self.theme_mode.set('light')
         self.notice_duration = tk.DoubleVar(value=max(1.,min(6.,float(self.config.get('notice_duration',3.)))))
         self.waiting_enabled=tk.BooleanVar(value=self.config.get('waiting_enabled',True))
-        self.waiting_frequency=tk.DoubleVar(value=max(.2,min(2.,float(self.config.get('waiting_frequency',.5)))))
+        legacy_frequency=max(.2,min(2.,float(self.config.get('waiting_frequency',1.))))
+        self.waiting_period=tk.DoubleVar(value=max(.5,min(2.,float(self.config.get('waiting_period',1./legacy_frequency)))))
+        self.config.pop('waiting_frequency',None)
         self.gloss_enabled=tk.BooleanVar(value=self.config.get('gloss_enabled',True))
         self.gloss_duration=tk.DoubleVar(value=max(.15,min(1.5,float(self.config.get('gloss_duration',.45)))))
         self.config.pop('waiting_color',None)
-        for name,default in (('gloss_color','#ffffff'),):
+        for name,default in (('gloss_color',GOLD),):
             value=self.config.get(name,default)
             setattr(self,name,value if isinstance(value,str) and re.fullmatch(r'#[0-9a-fA-F]{6}',value) else default)
         self.bpm_correction = tk.StringVar(value=self.config.get('bpm_correction','auto'))
@@ -982,6 +1008,9 @@ class App:
             style.configure(name,background=bg,foreground=fg)
         style.configure('TButton',background=button,foreground=fg,padding=4)
         style.map('TButton',background=[('active','#505866' if dark else '#d6d6d6')],foreground=[('disabled',muted)])
+        style.configure('TMenubutton',background=button,foreground=fg,arrowcolor=fg,padding=4)
+        style.map('TMenubutton',background=[('active','#505866' if dark else '#d6d6d6')],foreground=[('disabled',muted)])
+        style.configure('Value.TLabel',background=field,foreground=fg,padding=(8,4))
         for name in ('TCheckbutton','TRadiobutton'):
             style.map(name,background=[('active',bg)],foreground=[('disabled',muted)])
         style.configure('TEntry',fieldbackground=field,foreground=fg,insertcolor=fg)
@@ -1004,8 +1033,9 @@ class App:
                 if element.lower().endswith('.focus'): result.extend(options.get('children',[]))
                 else: result.append((element,options))
             return result
-        for name in ('TButton','TCheckbutton','TRadiobutton','TNotebook.Tab'):
+        for name in ('TButton','TMenubutton','TCheckbutton','TRadiobutton','TNotebook.Tab'):
             style.layout(name,without_focus(style.layout(name)))
+        self.apply_checkmarks(style,button,muted)
         self.root.option_add('*TCombobox*Listbox.background',field)
         self.root.option_add('*TCombobox*Listbox.foreground',fg)
         excluded={sprite.win for sprite in self.sprites}
@@ -1015,6 +1045,7 @@ class App:
             try:
                 if isinstance(widget,(tk.Tk,tk.Toplevel)): widget.configure(bg=bg)
                 elif isinstance(widget,tk.Canvas): widget.configure(bg=bg)
+                elif isinstance(widget,tk.Menu): widget.configure(bg=field,fg=fg,activebackground='#2769ad',activeforeground='#ffffff',disabledforeground=muted)
                 elif isinstance(widget,tk.Scale): widget.configure(bg=bg,fg=fg,troughcolor=button,activebackground=field,highlightbackground=bg)
                 elif isinstance(widget,tk.Listbox):
                     widget.configure(bg=field,fg=fg,selectbackground='#2769ad',selectforeground='#ffffff')
@@ -1025,6 +1056,33 @@ class App:
             except tk.TclError: pass
             for child in widget.winfo_children(): paint(child)
         paint(self.root)
+    def apply_checkmarks(self,style,background,muted):
+        size=max(16,round(14*float(self.root.tk.call('tk','scaling'))))
+        images={}
+        for state in ('off','on','disabled_off','disabled_on','mixed'):
+            image=Image.new('RGBA',(size+5,size),(0,0,0,0)); draw=ImageDraw.Draw(image)
+            selected=state in ('on','disabled_on','mixed'); disabled=state.startswith('disabled')
+            draw.rounded_rectangle((1,1,size-2,size-2),radius=3,fill=muted if disabled and selected else GOLD if selected else background,outline=muted,width=1)
+            if state=='mixed': draw.line((size*.25,size*.5,size*.72,size*.5),fill='#161616',width=max(2,size//9))
+            elif selected:
+                draw.line([(round(size*.22),round(size*.49)),(round(size*.43),round(size*.69)),(round(size*.77),round(size*.28))],fill='#161616',width=max(2,size//8))
+            images[state]=image
+        if not hasattr(self,'checkmark_images'):
+            self.checkmark_images={name:ImageTk.PhotoImage(image,master=self.root) for name,image in images.items()}
+            style.element_create('TickCheck.indicator','image',self.checkmark_images['off'],
+                ('disabled selected',self.checkmark_images['disabled_on']),('disabled',self.checkmark_images['disabled_off']),
+                ('alternate',self.checkmark_images['mixed']),('selected',self.checkmark_images['on']),sticky='w')
+        else:
+            for name,image in images.items(): self.checkmark_images[name].paste(image)
+        def replace_indicator(layout):
+            result=[]
+            for name,options in layout:
+                options=dict(options)
+                if 'children' in options: options['children']=replace_indicator(options['children'])
+                if name.endswith('.indicator'): name='TickCheck.indicator'
+                result.append((name,options))
+            return result
+        style.layout('TCheckbutton',replace_indicator(style.layout('TCheckbutton')))
     def set_theme(self):
         self.apply_theme(); self.save()
 
@@ -1197,14 +1255,20 @@ class App:
         self.flip_shift_button.pack(side='right'); self.flip_shift_button.state(['disabled'])
         row=ttk.Frame(animation); row.pack(fill='x',pady=(0,5))
         ttk.Label(row,text='翻转样式',width=16).pack(side='left')
-        self.flip_style_combo=ttk.Combobox(row,values=list(FLIP_STYLES),state='readonly',width=16)
-        self.sync_flip_style()
-        self.flip_style_combo.pack(side='left')
-        self.flip_style_combo.bind('<<ComboboxSelected>>',self.set_flip_style)
+        self.flip_style_picker=self.choice_picker(row,FLIP_STYLES,self.flip_style,self.set_flip_style)
+        self.flip_style_picker.pack(side='left')
+        row=ttk.Frame(animation); row.pack(fill='x',pady=(0,5))
+        ttk.Label(row,text='翻转方向',width=16).pack(side='left')
+        self.flip_direction_picker=self.choice_picker(row,FLIP_DIRECTIONS,self.flip_direction,self.set_flip_direction)
+        self.flip_direction_picker.pack(side='left')
         row=ttk.Frame(animation); row.pack(fill='x')
         ttk.Label(row,text='翻转 BPM 阈值',width=16).pack(side='left')
-        ttk.Spinbox(row,from_=60,to=240,increment=5,textvariable=self.flip_bpm_threshold,width=6,
-                    state='readonly',command=self.save).pack(side='left')
+        self.flip_threshold_minus=ttk.Button(row,text='−',width=2,command=lambda:self.change_flip_threshold(-2))
+        self.flip_threshold_minus.pack(side='left')
+        self.flip_threshold_value=ttk.Label(row,textvariable=self.flip_bpm_threshold,width=5,anchor='center',style='Value.TLabel')
+        self.flip_threshold_value.pack(side='left')
+        self.flip_threshold_plus=ttk.Button(row,text='+',width=2,command=lambda:self.change_flip_threshold(2))
+        self.flip_threshold_plus.pack(side='left')
         ttk.Label(row,text='BPM 及以上：压扁两次再翻转',foreground='#666666').pack(side='left',padx=8)
         ttk.Checkbutton(main,text='歌曲结束后询问节奏与 BPM 是否匹配（用于校准分析）',variable=self.feedback_enabled,command=self.save).pack(anchor='w',pady=(2,3))
 
@@ -1313,12 +1377,11 @@ class App:
         ttk.Separator(feature).pack(fill='x',pady=7)
         row=ttk.Frame(feature); row.pack(fill='x',pady=3)
         ttk.Checkbutton(row,text='等待播放时呼吸闪烁',variable=self.waiting_enabled,command=self.save).pack(side='left')
-        ttk.Label(row,text='（原图亮度与暗色遮罩渐变）',foreground='#666666').pack(side='left',padx=6)
         row=ttk.Frame(feature); row.pack(fill='x')
-        ttk.Label(row,text='呼吸频率',width=16).pack(side='left')
-        tk.Scale(row,variable=self.waiting_frequency,from_=.2,to=2.,resolution=.1,orient='horizontal',length=190,
+        ttk.Label(row,text='呼吸周期',width=16).pack(side='left')
+        tk.Scale(row,variable=self.waiting_period,from_=.5,to=2.,resolution=.1,orient='horizontal',length=190,
                  showvalue=False,highlightthickness=0,command=lambda value:self.save()).pack(side='left',padx=6)
-        ttk.Label(row,textvariable=self.waiting_frequency,width=4).pack(side='left'); ttk.Label(row,text='次/秒').pack(side='left')
+        ttk.Label(row,textvariable=self.waiting_period,width=4).pack(side='left'); ttk.Label(row,text='秒/次').pack(side='left')
         row=ttk.Frame(feature); row.pack(fill='x',pady=(6,3))
         ttk.Checkbutton(row,text='快捷对齐时显示光泽',variable=self.gloss_enabled,command=self.save).pack(side='left')
         self.gloss_preview=self.color_swatch(row,self.gloss_color,lambda:self.choose_effect_color('gloss_color','gloss_preview','选择对齐光泽颜色'))
@@ -1725,11 +1788,19 @@ class App:
     def toggle_flip(self):
         self.horizontal_flip.set(not self.horizontal_flip.get())
         self.reset_flip_timing(); self.save()
-    def sync_flip_style(self):
-        self.flip_style_combo.set(next(name for name,value in FLIP_STYLES.items() if value==self.flip_style.get()))
-    def set_flip_style(self,event=None):
-        if event is not None: self.flip_style.set(FLIP_STYLES[self.flip_style_combo.get()])
-        self.sync_flip_style(); self.save()
+    def choice_picker(self,parent,options,variable,command):
+        label=tk.StringVar(self.root)
+        def sync(*args): label.set(next(name for name,value in options.items() if value==variable.get()))
+        sync(); variable.trace_add('write',sync)
+        picker=ttk.Menubutton(parent,textvariable=label,width=16,direction='below')
+        menu=tk.Menu(picker,tearoff=False)
+        for name,value in options.items(): menu.add_radiobutton(label=name,variable=variable,value=value,command=command)
+        picker.configure(menu=menu); picker.choice_menu=menu; picker.choice_text=label
+        return picker
+    def change_flip_threshold(self,delta):
+        self.flip_bpm_threshold.set(max(60,min(240,self.flip_bpm_threshold.get()+delta))); self.save()
+    def set_flip_style(self): self.save()
+    def set_flip_direction(self): self.save()
     def shift_flip_beat(self):
         if not self.horizontal_flip.get() or not self.analyzer or not self.analyzer.is_playing():
             self.status.set('请先启用水平翻转，并播放音乐。'); return
@@ -1928,7 +1999,7 @@ class App:
         self.config['process' if mode=='process' else 'device']=source[1]
         self.save()
     def stop(self):
-        self.last_music_seen=-1e9; self.gloss_requested=False; self.gloss_started=-1e9
+        self.song_finished=False; self.gloss_requested=False; self.gloss_started=-1e9
         if self.analyzer: self.analyzer.stop(); self.analyzer=None
         self.clear_manual_bpm()
         self.offset.set(0.); self.offset_label.set('自动对齐')
@@ -1984,7 +2055,7 @@ class App:
                 loading_x=self.shared_loading_x, loading_y=self.shared_loading_y,
                 main_geometry=f'{max(610,self.root.winfo_width())}x{max(610,self.root.winfo_height())}',
                 size=self.size.get(), fps=int(self.fps.get()), amplitude=self.amplitude.get(), amplitude_scale_version=2,
-                horizontal_flip=self.horizontal_flip.get(), flip_style=self.flip_style.get(), flip_bpm_threshold=self.flip_bpm_threshold.get(),
+                horizontal_flip=self.horizontal_flip.get(), flip_style=self.flip_style.get(), flip_direction=self.flip_direction.get(), flip_bpm_threshold=self.flip_bpm_threshold.get(),
                 offset=0., feedback_enabled=self.feedback_enabled.get(),
                 end_silence=self.end_silence.get(),
                 fast_bpm_threshold=self.fast_bpm_threshold.get(),
@@ -1993,7 +2064,7 @@ class App:
                 flash_duration=self.flash_duration.get(), close_action=self.close_action.get(),
                 notice_enabled=self.notice_enabled.get(), notice_color=self.notice_color, notice_duration=self.notice_duration.get(),
                 notice_outline=self.notice_outline.get(), notice_outline_color=self.notice_outline_color, theme_mode=self.theme_mode.get(),
-                waiting_enabled=self.waiting_enabled.get(),waiting_frequency=self.waiting_frequency.get(),
+                waiting_enabled=self.waiting_enabled.get(),waiting_period=self.waiting_period.get(),
                 gloss_enabled=self.gloss_enabled.get(),gloss_duration=self.gloss_duration.get(),gloss_color=self.gloss_color,
                 bpm_correction=self.bpm_correction.get(), phase_correction=self.phase_correction.get())
             self.config['recent_images']=self.recent_images
@@ -2032,10 +2103,12 @@ class App:
                     elif self.source_mode.get()=='process':
                         self.status.set('未检测到播放中的声音，请确认播放器正在播放并重新查找。')
                 elif kind=='song_end':
+                    self.song_finished=True
                     self.reset_flip_timing()
                     self.offset.set(0.); self.offset_label.set('自动对齐')
                     if self.feedback_enabled.get(): self.song_feedback(value)
                 elif kind=='song_changed':
+                    self.song_finished=False
                     self.reset_flip_timing()
                     self.offset.set(0.); self.offset_label.set('自动对齐')
                 elif kind=='manual_unlock': self.clear_manual_bpm()
@@ -2077,10 +2150,11 @@ class App:
             button.state(['!disabled'] if playing and current and 40<=current*factor<=300 else ['disabled'])
         self.flip_shift_button.state(['!disabled'] if playing and beat and self.horizontal_flip.get() and bpm>=self.flip_bpm_threshold.get() else ['disabled'])
         now=time.monotonic(); dt=min(.2,max(.001,now-self.last_frame_time)); self.last_frame_time=now
-        if playing: self.last_music_seen=now
-        waiting=not playing and now-self.last_music_seen>.6
+        if playing: self.song_finished=False
+        finished=self.analyzer.has_ended() if self.analyzer and hasattr(self.analyzer,'has_ended') else self.song_finished
+        waiting=not playing
         self.visual_state='waiting' if waiting else ('analyzing' if playing and not bpm else 'playing')
-        self.idle_step=breathing_step(now,self.waiting_frequency.get()) if waiting and self.waiting_enabled.get() else -1
+        self.idle_step=breathing_step(now,1./self.waiting_period.get()) if self.analyzer and waiting and finished and self.waiting_enabled.get() else -1
         gloss_age=now-self.gloss_started; gloss_duration=self.gloss_duration.get()
         self.shine_step=round(gloss_age/gloss_duration*64) if self.gloss_enabled.get() and 0<=gloss_age<gloss_duration else -1
         active=bool(playing and level>.002 and beat)
@@ -2128,7 +2202,8 @@ class App:
             self.flip_last_index=index
             effective=index+self.flip_pair_offset+cadence*self.flip_face_bias
             self.flip_cadence=cadence; self.flip_squash_count=(index+self.flip_pair_offset+1)%cadence
-            self.flip_angle=flip_pose(effective,age,attack,hold,release,cadence,self.flip_style.get())
+            direction=1 if self.flip_direction.get()=='clockwise' else -1
+            self.flip_angle=flip_pose(effective,age,attack,hold,release,cadence,self.flip_style.get(),direction)
         elapsed=now-self.flash_started; duration=max(.1,float(self.flash_duration.get()))
         flash=1-elapsed/duration if self.flash_enabled.get() and 0<=elapsed<duration else 0.
         color=tuple(int(self.flash_color[i:i+2],16) for i in (1,3,5))

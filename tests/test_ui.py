@@ -129,10 +129,20 @@ def test_window_and_image_flow():
                 application.close_update_progress()
                 assert [application.settings_notebook.tab(tab,'text') for tab in application.settings_notebook.tabs()] == ['常规','功能','关于']
                 assert application.flash_enabled.get() and application.notice_enabled.get()
-                assert application.flash_color == '#ffff00' and application.notice_color == '#ffff00'
+                assert application.flash_color == module.GOLD and application.notice_color == module.GOLD and application.gloss_color == module.GOLD
                 assert application.notice_outline.get() and application.notice_outline_color == '#000000'
                 assert application.fast_bpm_threshold.get() == 190 and application.end_silence.get() == 3.5
                 assert application.flip_bpm_threshold.get() == 100
+                assert application.waiting_period.get()==1.
+                assert isinstance(application.flip_threshold_value,module.ttk.Label)
+                assert isinstance(application.flip_style_picker,module.ttk.Menubutton)
+                application.flip_threshold_plus.invoke(); assert application.flip_bpm_threshold.get()==102
+                application.flip_threshold_minus.invoke(); assert application.flip_bpm_threshold.get()==100
+                application.flip_bpm_threshold.set(240); application.flip_threshold_plus.invoke()
+                assert application.flip_bpm_threshold.get()==240
+                application.flip_bpm_threshold.set(60); application.flip_threshold_minus.invoke()
+                assert application.flip_bpm_threshold.get()==60
+                application.flip_bpm_threshold.set(100)
                 application.settings_notebook.select(1); application.settings_window.update()
                 with patch.object(module.colorchooser,'askcolor',return_value=((18,52,86),'#123456')):
                     application.color_preview.event_generate('<Button-1>'); application.settings_window.update()
@@ -243,8 +253,8 @@ def test_window_and_image_flow():
                 assert getlong(handle,-20)&0x80 and not getlong(handle,-20)&0x40000
                 assert getlong(handle,-8)
                 colors={color for _,color in application.sprites[0].notice_bitmap.getcolors()}
-                assert colors <= {(255,255,0),(0,0,0),(255,0,255)}
-                assert (255,255,0) in colors and (0,0,0) in colors
+                assert colors <= {(255,215,0),(0,0,0),(255,0,255)}
+                assert (255,215,0) in colors and (0,0,0) in colors
                 application.notice_outline.set(False)
                 application.sprites[0].update_notice(module.time.monotonic())
                 assert (0,0,0) not in {color for _,color in application.sprites[0].notice_bitmap.getcolors()}
@@ -503,16 +513,17 @@ def test_waiting_gloss_and_mouse_shortcuts():
             application=module.App()
             try:
                 class Player:
-                    bpm=0.; playing=False; aligned=0
+                    bpm=0.; playing=False; aligned=0; ended=False
                     def values(self): return self.bpm,.2,10.,.12,1.
                     def is_playing(self): return self.playing
+                    def has_ended(self): return self.ended
                     def realign(self): self.aligned+=1
                 player=Player(); application.analyzer=player
                 def tick(now):
                     application.root.after_cancel(application.tick_job)
                     with patch.object(module.time,'monotonic',return_value=now): application.tick()
                 tick(1000.)
-                assert application.visual_state=='waiting' and application.idle_step>=0
+                assert application.visual_state=='waiting' and application.idle_step==-1
                 assert application.sprites[0].render_key[-1]==-1
                 player.playing=True; tick(1001.)
                 assert application.visual_state=='analyzing' and application.idle_step==-1
@@ -563,7 +574,14 @@ def test_waiting_gloss_and_mouse_shortcuts():
                 tick(1003.)
                 assert application.shine_step==-1
                 player.playing=False; tick(1003.7)
+                assert application.visual_state=='waiting' and application.idle_step==-1
+                tick(1010.)
+                assert application.idle_step==-1  # A long media pause is not a confirmed song end.
+                player.ended=True; tick(1010.1)
                 assert application.visual_state=='waiting' and application.idle_step>=0
+                player.playing=True; player.ended=False; tick(1010.2)
+                assert application.idle_step==-1
+                player.playing=False
                 menus=[]
                 with patch.object(module.tk.Menu,'tk_popup',lambda menu,*args:menus.append(menu)):
                     sprite.context_menu(SimpleNamespace(x_root=100,y_root=100))
@@ -572,10 +590,21 @@ def test_waiting_gloss_and_mouse_shortcuts():
                 assert '节奏提前一点（Shift+鼠标左键）' in labels and '恢复自动（Shift+鼠标中键）' in labels
                 assert all('不学习' not in label for label in labels)
                 index=next(i for i in range(menu.index('end')+1) if menu.type(i)=='command' and menu.entrycget(i,'label')=='启用翻转动画')
+                advance=next(i for i in range(menu.index('end')+1) if menu.type(i)=='command' and menu.entrycget(i,'label')=='翻转动画快进一拍')
+                assert menu.entrycget(advance,'state')=='disabled'
                 menu.invoke(index); assert application.horizontal_flip.get()
+                with patch.object(module.tk.Menu,'tk_popup',lambda menu,*args:menus.append(menu)):
+                    sprite.context_menu(SimpleNamespace(x_root=100,y_root=100))
+                enabled=menus[-1]
+                advance=next(i for i in range(enabled.index('end')+1) if enabled.type(i)=='command' and enabled.entrycget(i,'label')=='翻转动画快进一拍')
+                assert enabled.entrycget(advance,'state')=='normal'
+                player.playing=True
+                enabled.invoke(advance); assert application.flip_shift_pending==1
                 application.toggle_flip(); assert not application.horizontal_flip.get()
+                player.playing=False
                 application.show_settings(); application.root.update()
-                assert find_label(application.settings_window,'呼吸频率') and find_label(application.settings_window,'光泽划过时间')
+                assert find_label(application.settings_window,'呼吸周期') and find_label(application.settings_window,'光泽划过时间')
+                assert not find_label(application.settings_window,'（原图亮度与暗色遮罩渐变）')
                 application.settings_notebook.select(1); application.root.update()
                 application.notice_enabled.set(False); application.set_notice_enabled()
                 with patch.object(module.colorchooser,'askcolor') as chooser:
@@ -583,13 +612,12 @@ def test_waiting_gloss_and_mouse_shortcuts():
                     chooser.assert_not_called()
                 application.notice_enabled.set(True); application.set_notice_enabled()
                 assert not hasattr(application,'waiting_preview')
-                application.waiting_frequency.set(.8)
+                application.waiting_period.set(.8)
                 application.gloss_duration.set(.7); application.gloss_color='#ffff00'; application.save()
                 saved=json.loads(Path(module.CONFIG).read_text(encoding='utf-8'))
-                assert saved['waiting_frequency']==.8 and 'waiting_color' not in saved
+                assert saved['waiting_period']==.8 and 'waiting_color' not in saved and 'waiting_frequency' not in saved
                 assert saved['gloss_duration']==.7 and saved['gloss_color']=='#ffff00'
-                application.flip_style_combo.set('3D 翻转')
-                application.flip_style_combo.event_generate('<<ComboboxSelected>>')
+                application.flip_style_picker.choice_menu.invoke(1)
                 assert application.flip_style.get()=='perspective'
                 assert json.loads(Path(module.CONFIG).read_text(encoding='utf-8'))['flip_style']=='perspective'
                 sprite.render(1.,1.,0.,(255,255,255),flip_angle=60)
@@ -597,7 +625,14 @@ def test_waiting_gloss_and_mouse_shortcuts():
                 application.flip_style.set('flat'); application.set_flip_style()
                 sprite.render(1.,1.,0.,(255,255,255),flip_angle=60)
                 assert sprite.photo is not perspective_photo
-                assert application.flip_style_combo.get()=='平面翻转'
+                assert application.flip_style_picker.choice_text.get()=='平面翻转'
+                application.flip_direction_picker.choice_menu.invoke(1)
+                assert application.flip_direction.get()=='counterclockwise'
+                assert json.loads(Path(module.CONFIG).read_text(encoding='utf-8'))['flip_direction']=='counterclockwise'
+                player.playing=True
+                with patch.object(module,'flip_pose',wraps=module.flip_pose) as pose:
+                    application.horizontal_flip.set(True); tick(1010.3)
+                    assert pose.call_args.args[-1]==-1
                 text=module.tk.Text(application.root)
                 module.render_release_notes(text,'本次更新\n1、简短内容\n\n下载与安装\n后面的内容\n更新记录\n历史内容')
                 assert '简短内容' in text.get('1.0','end') and '后面的内容' not in text.get('1.0','end')
@@ -610,13 +645,15 @@ def test_old_image_migration():
     with tempfile.TemporaryDirectory() as directory:
         root=Path(directory); config=root/'设置.json'; old=root/'old.png'
         Image.new('RGBA',(20,20),'blue').save(old)
-        config.write_text(json.dumps({'image':str(old),'recent_images':[str(old)],'flip_style':'perspective','waiting_color':'#ff0000'}),encoding='utf-8')
+        config.write_text(json.dumps({'image':str(old),'recent_images':[str(old)],'flip_style':'perspective','flip_direction':'counterclockwise','waiting_color':'#ff0000','waiting_frequency':2.,'flash_color':'#123456'}),encoding='utf-8')
         with patch.object(module,'CONFIG',str(config)),patch.object(module.App,'make_tray'),patch.object(module.App,'refresh_sources'):
             application=module.App()
             try:
                 assert application.shared_image_path=='stored:old.png'
-                assert application.flip_style.get()=='perspective' and application.flip_style_combo.get()=='3D 翻转'
+                assert application.flip_style.get()=='perspective' and application.flip_style_picker.choice_text.get()=='3D 翻转'
                 assert 'waiting_color' not in application.config
+                assert application.waiting_period.get()==.5 and 'waiting_frequency' not in application.config
+                assert application.flip_direction.get()=='counterclockwise' and application.flash_color=='#123456'
                 assert 'stored:old.png' in application.recent_images
                 assert old.exists() and (root/'图片'/'old.png').exists()
                 application.save()
@@ -626,6 +663,7 @@ def test_old_image_migration():
             try:
                 assert application.shared_image_path=='stored:old.png' and 'stored:old.png' in application.recent_images
                 assert application.flip_style.get()=='perspective' and 'waiting_color' not in application.config
+                assert application.waiting_period.get()==.5 and application.flip_direction.get()=='counterclockwise'
             finally: application.quit()
 
 def test_import_square_crop():

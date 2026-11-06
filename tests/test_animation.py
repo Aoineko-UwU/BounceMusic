@@ -18,6 +18,10 @@ def test_flip_grid():
     assert pose(1,.28)<pose(1,.38)
     assert flip_pose(1,.5,.10,.08,.30,2,'perspective')==180.
     assert flip_pose(1,.28,.10,.08,.30,2,'perspective')!=pose(1,.28)
+    forward=flip_pose(1,.33,.10,.08,.30,2,'perspective',1)
+    reverse=flip_pose(1,.33,.10,.08,.30,2,'perspective',-1)
+    assert 0<forward<180 and 180<reverse<360 and abs(forward+reverse-360)<1e-8
+    assert 180<pose(3,.33)<360  # Subsequent half-turns keep the selected direction.
 
 
 def test_flat_alpha():
@@ -58,6 +62,7 @@ def test_waiting_and_shine_alpha():
     for frame in (dark,bright,shine): assert frame.getchannel('A').tobytes()==source.getchannel('A').tobytes()
     assert sum(dark.getpixel((20,20))[:3])<sum(bright.getpixel((20,20))[:3])
     assert bright.tobytes()==source.tobytes()  # The original image is the brightest state.
+    assert dark.getpixel((20,20))[:3]==(26,52,104)  # Darkest state retains 65% brightness.
     for step in (0,16,32,48,64):
         frame=feedback_frame(source,idle_step=step)
         assert frame.getchannel('A').tobytes()==source.getchannel('A').tobytes()

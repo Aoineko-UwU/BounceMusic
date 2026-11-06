@@ -29,6 +29,10 @@ def test_routes_and_progress():
                     return any(name.lower().endswith('.focus') or has_focus(options.get('children',[])) for name,options in layout)
                 for name in ('TButton','TCheckbutton','TRadiobutton','TNotebook.Tab'):
                     assert not has_focus(style.layout(name))
+                def element_names(layout):
+                    return [value for name,options in layout for value in [name,*element_names(options.get('children',[]))]]
+                assert 'TickCheck.indicator' in element_names(style.layout('TCheckbutton'))
+                assert all(str(photo) in application.root.tk.call('image','names') for photo in application.checkmark_images.values())
             result={'id':'github','ok':True,'speed':2097152.,'latency':123.,'quality':'优'}
             panel.route_result(panel.probe_token,result)
             assert tree.item('github','values')[1]=='2.00 MB/s'
