@@ -61,6 +61,12 @@ flowchart LR
 
 选择网易云音乐或 QQ 音乐进程时，如果播放器向 Windows 提供媒体会话，程序会参考播放、暂停和曲目变化状态；没有提供时则通过音频静音情况判断。不同歌曲对“主拍”和“半拍”的理解可能不同，歌词或复杂混音也可能干扰鼓点识别，因此自动分析不能保证每首歌都完全准确。
 
+## 更新下载线路
+
+“关于 → 下载线路与测速”及更新弹窗均可选择自动线路、GH-Proxy、GHFast、GHProxy.net 或 GitHub 直连。测速小量读取真实安装包，显示参考速度、响应时间和当前可用性；“自动选择”优先使用实测较快的线路，也可关闭失败自动换线。
+
+下载窗口显示当前线路、速度、进度和预计剩余时间，可暂停、继续、中断或切换线路。换线时尽量续传；服务器不支持时会提示重新下载。失败后可换线路直接重试。版本信息和 SHA-256 仍从 GitHub 官方获取，每个下载包均验证完整性。
+
 ## 从源码运行与构建
 
 需要 Windows 10/11 64 位、Python 3.12。在仓库根目录运行：
@@ -86,6 +92,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 | [`src/shortcuts.py`](src/shortcuts.py) | 固定鼠标组合键与对应操作 |
 | [`src/media_status.py`](src/media_status.py) | 可用时读取 Windows 媒体会话的播放状态 |
 | [`src/updater.py`](src/updater.py)、[`src/updater.ps1`](src/updater.ps1) | 检查更新、下载校验与替换程序 |
+| [`src/download_routes.py`](src/download_routes.py)、[`src/update_ui.py`](src/update_ui.py) | 多线路测速、续传、换线及两个版本共用的更新界面 |
 | [`assets/`](assets)、[`installer/`](installer) | 内置图片、图标与安装器配置 |
 | [`tests/`](tests) | 节奏、界面和更新流程的检查 |
 
