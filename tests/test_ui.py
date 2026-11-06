@@ -51,6 +51,10 @@ def test_window_and_image_flow():
                 assert module.flip_projection(180)[1] is True
                 application.root.geometry('800x720')
                 application.root.update()
+                application.main_canvas.yview_moveto(1); application.root.update()
+                threshold=find_label(application.root,'翻转 BPM 阈值')
+                assert threshold.winfo_rooty()<application.root.winfo_rooty()+application.root.winfo_height()
+                application.main_canvas.yview_moveto(0); application.root.update()
                 for name in ('动画幅度',):
                     label=find_label(application.root,name)
                     scale=next(child for child in label.master.winfo_children() if isinstance(child,module.tk.Scale))
@@ -143,7 +147,9 @@ def test_window_and_image_flow():
                 application.loading_target.current(1)
                 application.on_loading_target_selected()
                 assert (application.loading_x.get(),application.loading_y.get()) == (25,70)
-                for name in ('最高弹跳速度','翻转 BPM 阈值','渐隐时间','歌曲结束判定阈值'):
+                assert find_label(application.root,'翻转 BPM 阈值')
+                assert not find_label(application.settings_window,'翻转 BPM 阈值')
+                for name in ('最高弹跳速度','渐隐时间','歌曲结束判定阈值'):
                     application.settings_notebook.select(0 if name=='歌曲结束判定阈值' else 1)
                     application.settings_window.update()
                     label=find_label(application.settings_window,name)
@@ -175,6 +181,12 @@ def test_window_and_image_flow():
                     def lock_bpm(self, value): self.manual_bpm = value
                     def realign(self): self.aligned = True
                 application.analyzer = PlayingAnalyzer()
+                application.scale_bpm(.5)
+                assert application.analyzer.manual_bpm==60. and 'bpm_examples' not in application.config
+                application.scale_bpm(2.)
+                assert application.analyzer.manual_bpm==120. and 'bpm_examples' not in application.config
+                assert second.middle_click(None)=='break' and application.analyzer.aligned
+                application.unlock_manual_bpm()
                 application.manual_bpm_text.set('115')
                 application.apply_manual_bpm()
                 assert application.analyzer.manual_bpm == 115.
@@ -208,6 +220,16 @@ def test_window_and_image_flow():
                 application.tick()
                 assert application.sprites[0].notice_window is not None
                 assert application.sprites[0].notice_text == 'BPM 123'
+                notice=application.sprites[0].notice_window
+                assert str(notice.transient())==str(application.sprites[0].win)
+                import ctypes
+                user32=ctypes.WinDLL('user32')
+                user32.GetParent.argtypes=(ctypes.c_void_p,); user32.GetParent.restype=ctypes.c_void_p
+                getlong=user32.GetWindowLongPtrW
+                getlong.argtypes=(ctypes.c_void_p,ctypes.c_int); getlong.restype=ctypes.c_ssize_t
+                handle=user32.GetParent(notice.winfo_id()) or notice.winfo_id()
+                assert getlong(handle,-20)&0x80 and not getlong(handle,-20)&0x40000
+                assert getlong(handle,-8)
                 colors={color for _,color in application.sprites[0].notice_bitmap.getcolors()}
                 assert colors <= {(255,255,0),(0,0,0),(255,0,255)}
                 assert (255,255,0) in colors and (0,0,0) in colors
@@ -406,8 +428,11 @@ def test_horizontal_flip_alternates_on_beats():
                 class PlayingAnalyzer:
                     beat=999.1
                     bpm=80.
+                    origin=999.1
                     def values(self): return self.bpm, .2, self.beat, .12, 1.
                     def is_playing(self): return True
+                    def beat_origin(self): return self.origin
+                    def realign(self): self.origin=self.beat
                 analyzer=PlayingAnalyzer()
                 application.analyzer=analyzer
                 def step(now,beat,bpm):
@@ -428,6 +453,27 @@ def test_horizontal_flip_alternates_on_beats():
                 assert application.flip_angle==180. and application.flip_squash_count==1
                 step(1002.8,1002.4,120.)
                 assert application.flip_angle==0. and application.flip_squash_count==0
+                analyzer.origin=1002.9
+                step(1003.3,1002.9,120.)
+                assert application.flip_angle==0. and application.flip_squash_count==1
+                step(1003.8,1003.4,120.)
+                assert application.flip_angle==180.
+                step(1004.8,1004.4,120.)
+                assert application.flip_angle==0.  # A skipped render frame does not lose a squash.
+                analyzer.origin=1005.
+                step(1005.05,1005.,120.)
+                application.shift_flip_beat()
+                assert application.flip_shift_pending
+                step(1005.1,1005.,120.)
+                assert application.flip_shift_pending and application.flip_pair_offset==0
+                step(1005.6,1005.5,120.)
+                assert not application.flip_shift_pending and application.flip_pair_offset==1
+                assert application.flip_angle==0.  # Keep the facing direction at the switch boundary.
+                step(1006.4,1006.,120.)
+                assert application.flip_angle==180.
+                application.realign_rhythm()
+                assert application.flip_pair_offset==0 and application.flip_face_bias==0
+                assert not application.flip_shift_pending and 'bpm_examples' not in application.config
                 application.flip_bpm_threshold.set(130); application.save()
                 assert json.loads(Path(module.CONFIG).read_text(encoding='utf-8'))['flip_bpm_threshold']==130
             finally:
