@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageTk, ImageOps, ImageSequence, ImageFont
 import updater
 from update_ui import UpdatePanel
 from media_status import MediaMonitor
-from animation import flip_pose, flat_frame, perspective_frame, feedback_frame, breathing_step
+from animation import flip_pose, flat_frame, perspective_frame, feedback_frame, breathing_step, keyed_frame
 from shortcuts import DEFAULTS, BINDING_LABELS, mouse_code
 
 BASE = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
@@ -30,7 +30,7 @@ PRESET_DIR = os.path.join(ASSET_BASE, 'assets', 'presets')
 PRESET_NAMES = ('凑企鹅', '焗雪梨', '糖猫', 'baka', 'doro', 'ksm')
 PRESET_IMAGES = {'preset:' + name: os.path.join(PRESET_DIR, name + '.png') for name in PRESET_NAMES}
 PRESET_OPTIONS = ('', 'preset:matou', *PRESET_IMAGES)
-VERSION = '1.8.2'
+VERSION = '1.8.3'
 AUTHOR = '葵猫猫'
 FLIP_STYLES = {'平面翻转':'flat', '3D 翻转':'perspective'}
 FLIP_DIRECTIONS = {'顺时针':'clockwise', '逆时针':'counterclockwise'}
@@ -156,6 +156,9 @@ def flip_projection(angle):
     """A Y-axis card turn: width narrows edge-on, then the image faces the other way."""
     projection=math.cos(math.radians(angle))
     return max(.06,abs(projection)), projection < 0
+
+def even_flip_threshold(value):
+    return max(60,min(240,2*((int(value)+1)//2)))
 
 def set_window_icon(window):
     try: window.iconbitmap(APP_ICON)
@@ -757,8 +760,7 @@ class SpriteWindow:
                 ox=max(0,min(side-overlay.width,round(left+w*position_x/100-overlay.width/2)))
                 oy=max(0,min(side-overlay.height,round(top+h*position_y/100-overlay.height/2)))
                 canvas.alpha_composite(overlay,(ox,oy))
-        alpha = canvas.getchannel('A').point(lambda p: 255 if p >= 12 else 0)
-        keyed = Image.composite(canvas.convert('RGB'), Image.new('RGB', canvas.size, (255,0,255)), alpha)
+        keyed = keyed_frame(canvas)
         self.photo = ImageTk.PhotoImage(keyed)
         self.label.config(image=self.photo)
         self.app.frame_cache[key] = self.photo
@@ -924,7 +926,7 @@ class App:
         if self.fps.get() not in ('15','24','30','45','60','90','120','144'):
             self.fps.set('30')
         self.fast_bpm_threshold=tk.IntVar(value=max(80,min(240,int(self.config.get('fast_bpm_threshold',190)))))
-        self.flip_bpm_threshold=tk.IntVar(value=max(60,min(240,int(self.config.get('flip_bpm_threshold',100)))))
+        self.flip_bpm_threshold=tk.IntVar(value=even_flip_threshold(self.config.get('flip_bpm_threshold',100)))
         self.amplitude = tk.DoubleVar(value=amplitude_from_config(self.config))
         self.horizontal_flip = tk.BooleanVar(value=bool(self.config.get('horizontal_flip',False)))
         self.flip_style=tk.StringVar(value=self.config.get('flip_style','flat'))
@@ -1503,7 +1505,8 @@ class App:
                 self.sprite_list.see(i)
                 self.size.set(sprite.size)
                 self.sync_loading_position()
-                if hasattr(self,'loading_target') and self.loading_target.winfo_exists() and self.image_mode.get()=='multiple':
+                if (hasattr(self,'loading_target') and self.loading_target.winfo_exists()
+                        and self.image_mode.get()=='multiple' and i<len(self.loading_target['values'])):
                     self.loading_target.current(i)
                 break
     def on_sprite_selected(self, event=None):
@@ -1518,8 +1521,8 @@ class App:
             path=self.shared_image_path if self.image_mode.get()=='uniform' else sprite.image_path
             name=self.image_name(path)
             self.sprite_list.insert(tk.END,f'图片 {sprite.id} · {name}')
-        if self.selected_id is not None: self.select_sprite(self.selected_id)
         self.refresh_loading_targets()
+        if self.selected_id is not None: self.select_sprite(self.selected_id)
     def refresh_loading_targets(self):
         if not hasattr(self,'loading_target') or not self.loading_target.winfo_exists(): return
         if self.image_mode.get()=='uniform':
@@ -1709,16 +1712,13 @@ class App:
                 self.image_cache.pop(path,None); self.picker_thumbnails.pop(path,None)
             original=self.get_image(path)
             if target_sprite is not None:
-                if self.image_mode.get()=='uniform' and len(self.sprites)>1:
-                    for sprite in self.sprites:
-                        sprite.image_path=self.shared_image_path; sprite.original=self.shared_original
-                        sprite.render_key=None
-                    self.image_mode.set('multiple')
-                    self.status.set('已切换到“使用多种图片”，本次只更改右键点击的窗口。')
-                elif self.image_mode.get()=='uniform':
+                if self.image_mode.get()=='uniform':
                     self.shared_image_path=path; self.shared_original=original
-                target_sprite.image_path=path; target_sprite.original=original
-                target_sprite.render_key=None
+                    for sprite in self.sprites:
+                        sprite.image_path=path; sprite.original=original; sprite.render_key=None
+                else:
+                    target_sprite.image_path=path; target_sprite.original=original
+                    target_sprite.render_key=None
             elif self.image_mode.get()=='uniform': self.shared_image_path=path; self.shared_original=original
             else:
                 sprite=self.selected_sprite()
@@ -1798,7 +1798,7 @@ class App:
         picker.configure(menu=menu); picker.choice_menu=menu; picker.choice_text=label
         return picker
     def change_flip_threshold(self,delta):
-        self.flip_bpm_threshold.set(max(60,min(240,self.flip_bpm_threshold.get()+delta))); self.save()
+        self.flip_bpm_threshold.set(even_flip_threshold(self.flip_bpm_threshold.get()+delta)); self.save()
     def set_flip_style(self): self.save()
     def set_flip_direction(self): self.save()
     def shift_flip_beat(self):

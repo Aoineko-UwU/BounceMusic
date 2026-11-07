@@ -142,6 +142,8 @@ def test_window_and_image_flow():
                 assert application.flip_bpm_threshold.get()==240
                 application.flip_bpm_threshold.set(60); application.flip_threshold_minus.invoke()
                 assert application.flip_bpm_threshold.get()==60
+                application.flip_bpm_threshold.set(101); application.flip_threshold_plus.invoke()
+                assert application.flip_bpm_threshold.get()==104
                 application.flip_bpm_threshold.set(100)
                 application.settings_notebook.select(1); application.settings_window.update()
                 with patch.object(module.colorchooser,'askcolor',return_value=((18,52,86),'#123456')):
@@ -333,6 +335,41 @@ def test_image_picker_presets_and_recent():
                 assert application.image_picker.winfo_x()>0 and application.image_picker.winfo_y()>0
             finally: application.quit()
 
+
+def test_transparent_sprite_effects():
+    with tempfile.TemporaryDirectory() as directory:
+        path=Path(directory)/'alpha.png'
+        image=Image.new('RGBA',(64,64),(0,0,0,0))
+        for x in range(8,56):
+            for y in range(8,56):
+                if not 24<=x<40 or not 24<=y<40:
+                    image.putpixel((x,y),(80,120,160,round((x-7)/48*255)))
+        image.save(path)
+        with patch.object(module,'CONFIG',str(Path(directory)/'设置.json')),patch.object(module.App,'make_tray'),patch.object(module.App,'refresh_sources'):
+            application=module.App()
+            try:
+                sprite=application.selected_sprite()
+                application.choose_image(str(path),target_sprite=sprite)
+                captured=[]
+                real_keyed=module.keyed_frame
+                def capture(frame):
+                    captured.append(frame.copy())
+                    return real_keyed(frame)
+                with patch.object(module,'keyed_frame',side_effect=capture):
+                    for effects in ((0.,-1,-1),(1.,-1,-1),(0.,32,-1),(0.,-1,32)):
+                        flash,idle,shine=effects
+                        sprite.render(1.,1.,flash,(255,215,0),idle_step=idle,shine_step=shine)
+                assert len(captured)==4
+                baseline=captured[0].getchannel('A').tobytes()
+                assert all(frame.getchannel('A').tobytes()==baseline for frame in captured[1:])
+                keyed=[real_keyed(frame) for frame in captured]
+                assert all(frame.getpixel((0,0))==(255,0,255) for frame in keyed)
+                assert all(frame.getpixel((keyed[0].width//2,keyed[0].height//2))==(255,0,255) for frame in keyed)
+                assert keyed[0].tobytes()!=keyed[1].tobytes()
+                assert keyed[0].tobytes()!=keyed[2].tobytes()
+                assert keyed[0].tobytes()!=keyed[3].tobytes()
+            finally: application.quit()
+
 def test_image_library_and_new_windows():
     with tempfile.TemporaryDirectory() as directory:
         root=Path(directory); config=str(root/'设置.json'); source=root/'original.png'
@@ -412,9 +449,15 @@ def test_multi_import_and_new_presets():
                 menu=menus[0]
                 assert '更改图像' in [menu.entrycget(index,'label') for index in range(menu.index('end')+1) if menu.type(index)=='cascade']
                 application.choose_image('preset:matou',target_sprite=first)
-                assert application.image_mode.get()=='multiple'
-                assert first.image_path=='preset:matou' and other.image_path==''
+                assert application.image_mode.get()=='uniform'
+                assert first.image_path==other.image_path==application.shared_image_path=='preset:matou'
+                application.image_mode.set('multiple'); application.set_image_mode()
+                application.select_sprite(other.id)
+                application.show_settings(); application.settings_window.update()
+                application.loading_target['values']=['统一图片']
                 application.choose_image('stored:one.png',target_sprite=first)
+                assert application.image_mode.get()=='multiple'
+                assert first.image_path=='stored:one.png' and other.image_path=='preset:matou'
                 application.choose_image('stored:one.png',target_sprite=other)
                 with patch.object(module.messagebox,'askyesno',return_value=False):
                     assert not application.delete_imported_image('stored:one.png')
@@ -645,7 +688,7 @@ def test_old_image_migration():
     with tempfile.TemporaryDirectory() as directory:
         root=Path(directory); config=root/'设置.json'; old=root/'old.png'
         Image.new('RGBA',(20,20),'blue').save(old)
-        config.write_text(json.dumps({'image':str(old),'recent_images':[str(old)],'flip_style':'perspective','flip_direction':'counterclockwise','waiting_color':'#ff0000','waiting_frequency':2.,'flash_color':'#123456'}),encoding='utf-8')
+        config.write_text(json.dumps({'image':str(old),'recent_images':[str(old)],'flip_style':'perspective','flip_direction':'counterclockwise','flip_bpm_threshold':101,'waiting_color':'#ff0000','waiting_frequency':2.,'flash_color':'#123456'}),encoding='utf-8')
         with patch.object(module,'CONFIG',str(config)),patch.object(module.App,'make_tray'),patch.object(module.App,'refresh_sources'):
             application=module.App()
             try:
@@ -654,6 +697,7 @@ def test_old_image_migration():
                 assert 'waiting_color' not in application.config
                 assert application.waiting_period.get()==.5 and 'waiting_frequency' not in application.config
                 assert application.flip_direction.get()=='counterclockwise' and application.flash_color=='#123456'
+                assert application.flip_bpm_threshold.get()==102
                 assert 'stored:old.png' in application.recent_images
                 assert old.exists() and (root/'图片'/'old.png').exists()
                 application.save()
@@ -664,6 +708,7 @@ def test_old_image_migration():
                 assert application.shared_image_path=='stored:old.png' and 'stored:old.png' in application.recent_images
                 assert application.flip_style.get()=='perspective' and 'waiting_color' not in application.config
                 assert application.waiting_period.get()==.5 and application.flip_direction.get()=='counterclockwise'
+                assert application.flip_bpm_threshold.get()==102
             finally: application.quit()
 
 def test_import_square_crop():
@@ -689,6 +734,7 @@ def test_import_square_crop():
 
 if __name__ == '__main__':
     test_window_and_image_flow()
+    test_transparent_sprite_effects()
     test_windows_10_uses_device_mode()
     test_single_instance_mutex()
     test_image_picker_presets_and_recent()
