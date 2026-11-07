@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 from PIL import Image, ImageDraw
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
-from animation import flip_pose, flat_frame, perspective_frame, feedback_frame, breathing_step, keyed_frame
+from animation import flip_pose, flat_frame, perspective_frame, feedback_frame, breathing_step
 from shortcuts import mouse_code
 
 
@@ -24,21 +24,6 @@ def test_flip_grid():
     assert 0<pose(3,.33)<180  # Every second turn comes back along the same path.
     assert pose(3,.28)>pose(3,.38) and pose(4,0.)==0.
     assert flip_pose(3,.5,.10,.08,.30,2,'flat',-1)==0.
-
-
-def test_keyed_alpha_coverage():
-    source=Image.new('RGBA',(80,80),(0,0,0,0))
-    for x in range(80):
-        for y in range(80): source.putpixel((x,y),(40,90,120,x*255//79))
-    shown=keyed_frame(source)
-    assert shown.mode=='RGB'
-    for x in (0,10,20,40,60,79):
-        coverage=sum(shown.getpixel((x,y))!=(255,0,255) for y in range(80))/80
-        assert abs(coverage-x/79)<.04,(x,coverage)
-    assert all(shown.getpixel((79,y))!=(255,0,255) for y in range(80))
-    magenta=Image.new('RGBA',(1,1),(255,0,255,255))
-    assert keyed_frame(magenta).getpixel((0,0))==(254,0,255)
-    assert keyed_frame(Image.new('RGBA',(1,1),(0,0,0,0))).getpixel((0,0))==(255,0,255)
 
 
 def test_flat_alpha():
@@ -98,5 +83,5 @@ def test_waiting_and_shine_alpha():
 
 
 if __name__=='__main__':
-    test_flip_grid(); test_keyed_alpha_coverage(); test_flat_alpha(); test_perspective_alpha(); test_waiting_and_shine_alpha()
+    test_flip_grid(); test_flat_alpha(); test_perspective_alpha(); test_waiting_and_shine_alpha()
     print('Animation checks passed.')

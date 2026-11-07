@@ -351,23 +351,20 @@ def test_transparent_sprite_effects():
                 sprite=application.selected_sprite()
                 application.choose_image(str(path),target_sprite=sprite)
                 captured=[]
-                real_keyed=module.keyed_frame
-                def capture(frame):
+                real_draw=module.LayeredSurface.draw
+                def capture(surface,frame):
                     captured.append(frame.copy())
-                    return real_keyed(frame)
-                with patch.object(module,'keyed_frame',side_effect=capture):
+                    return real_draw(surface,frame)
+                with patch.object(module.LayeredSurface,'draw',capture):
                     for effects in ((0.,-1,-1),(1.,-1,-1),(0.,32,-1),(0.,-1,32)):
                         flash,idle,shine=effects
                         sprite.render(1.,1.,flash,(255,215,0),idle_step=idle,shine_step=shine)
                 assert len(captured)==4
                 baseline=captured[0].getchannel('A').tobytes()
                 assert all(frame.getchannel('A').tobytes()==baseline for frame in captured[1:])
-                keyed=[real_keyed(frame) for frame in captured]
-                assert all(frame.getpixel((0,0))==(255,0,255) for frame in keyed)
-                assert all(frame.getpixel((keyed[0].width//2,keyed[0].height//2))==(255,0,255) for frame in keyed)
-                assert keyed[0].tobytes()!=keyed[1].tobytes()
-                assert keyed[0].tobytes()!=keyed[2].tobytes()
-                assert keyed[0].tobytes()!=keyed[3].tobytes()
+                assert all(frame.getpixel((0,0))[3]==0 for frame in captured)
+                assert all(frame.getpixel((frame.width//2,frame.height//2))[3]==0 for frame in captured)
+                assert all(captured[0].tobytes()!=frame.tobytes() for frame in captured[1:])
             finally: application.quit()
 
 def test_image_library_and_new_windows():

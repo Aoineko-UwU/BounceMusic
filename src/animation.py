@@ -4,11 +4,6 @@ from functools import lru_cache
 import numpy as np
 from PIL import Image
 
-_rng=np.random.default_rng(183)
-_COVERAGE32=np.stack([_rng.permutation(32)*32+_rng.integers(0,32,size=32)
-                       for _ in range(32)],axis=1).astype(np.uint16)
-
-
 def flip_pose(index, age, attack, hold, release, cadence, style='flat', direction=1):
     index=max(0,int(index)); cadence=max(1,int(cadence))
     before=index//cadence; after=(index+1)//cadence
@@ -17,27 +12,6 @@ def flip_pose(index, age, attack, hold, release, cadence, style='flat', directio
     progress=max(0.,min(1.,(age-attack-hold)/max(.001,release)))
     eased=progress**3*(10.+progress*(-15.+6.*progress)) if style=='perspective' else progress*progress*(3.-2.*progress)
     return direction*(start+(end-start)*eased)
-
-
-def keyed_frame(frame, key=(255, 0, 255)):
-    """Approximate RGBA on Tk's binary Windows color-key surface.
-
-    A stable 32x32 stratified coverage mask keeps soft edges and translucent details visible
-    without the solid dark blocks caused by treating every alpha > 12 as opaque.
-    """
-    rgba=np.asarray(frame.convert('RGBA'))
-    alpha=rgba[:, :, 3]
-    if np.all((alpha==0)|(alpha==255)):
-        visible=alpha==255
-    else:
-        threshold=_COVERAGE32[np.arange(frame.height)[:,None]%32,np.arange(frame.width)[None,:]%32]
-        visible=(alpha==255) | (alpha.astype(np.uint32)*1024 > threshold.astype(np.uint32)*256)
-    rgb=rgba[:, :, :3].copy()
-    rgb[~visible]=key
-    # A real magenta pixel must remain visible instead of becoming a color key.
-    collision=visible & np.all(rgb==key,axis=2)
-    rgb[collision,0]=254
-    return Image.fromarray(rgb,'RGB')
 
 
 def flat_frame(source, width, height, angle):

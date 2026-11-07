@@ -15,7 +15,8 @@ from PIL import Image, ImageDraw, ImageTk, ImageOps, ImageSequence, ImageFont
 import updater
 from update_ui import UpdatePanel
 from media_status import MediaMonitor
-from animation import flip_pose, flat_frame, perspective_frame, feedback_frame, breathing_step, keyed_frame
+from animation import flip_pose, flat_frame, perspective_frame, feedback_frame, breathing_step
+from layered import LayeredSurface
 from shortcuts import DEFAULTS, BINDING_LABELS, mouse_code
 
 BASE = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
@@ -30,7 +31,7 @@ PRESET_DIR = os.path.join(ASSET_BASE, 'assets', 'presets')
 PRESET_NAMES = ('凑企鹅', '焗雪梨', '糖猫', 'baka', 'doro', 'ksm')
 PRESET_IMAGES = {'preset:' + name: os.path.join(PRESET_DIR, name + '.png') for name in PRESET_NAMES}
 PRESET_OPTIONS = ('', 'preset:matou', *PRESET_IMAGES)
-VERSION = '1.8.3'
+VERSION = '1.8.4'
 AUTHOR = '葵猫猫'
 FLIP_STYLES = {'平面翻转':'flat', '3D 翻转':'perspective'}
 FLIP_DIRECTIONS = {'顺时针':'clockwise', '逆时针':'counterclockwise'}
@@ -589,16 +590,17 @@ class SpriteWindow:
         self.suppress_double_until=0.
         self.win = tk.Toplevel(app.root); self.win.withdraw()
         self.win.overrideredirect(True)
-        self.win.configure(bg=KEY)
-        self.win.wm_attributes('-transparentcolor', KEY)
         self.win.attributes('-topmost', app.top.get())
-        self.label = tk.Label(self.win, bg=KEY, bd=0, highlightthickness=0)
-        self.label.pack()
+        self.label = tk.Label(self.win, bd=0, highlightthickness=0)
+        self.label.pack(fill='both',expand=True)
         for number in (1,2,3): self.label.bind(f'<ButtonPress-{number}>',self.mouse_down)
         self.label.bind('<B1-Motion>', self.move)
         self.label.bind('<Double-Button-1>', self.double_click)
         self.label.bind('<MouseWheel>', self.wheel)
-        self.win.geometry('+%d+%d' % (max(0,int(x)), max(0,int(y))))
+        side=int(self.size*1.55)
+        self.win.geometry(f'{side}x{side}+{max(0,int(x))}+{max(0,int(y))}')
+        self.layered=LayeredSurface(self.win)
+        self.render(1.,1.,0.,(255,215,0))
         self.win.deiconify()
 
     @staticmethod
@@ -735,10 +737,10 @@ class SpriteWindow:
             return
         if key in self.app.frame_cache:
             self.photo = self.app.frame_cache[key]
-            self.label.config(image=self.photo)
+            self.layered.draw(self.photo)
             self.render_key = key
             return
-        canvas = Image.new('RGBA', (side, side), (255,0,255,0))
+        canvas = Image.new('RGBA', (side, side), (0,0,0,0))
         source=self.app.render_source(original,self.size)
         frame=(perspective_frame if style=='perspective' else flat_frame)(source,w,h,angle)
         frame=feedback_frame(frame,idle_step=idle_step,shine_step=shine_step,shine_color=color_rgb(self.app.gloss_color))
@@ -760,9 +762,8 @@ class SpriteWindow:
                 ox=max(0,min(side-overlay.width,round(left+w*position_x/100-overlay.width/2)))
                 oy=max(0,min(side-overlay.height,round(top+h*position_y/100-overlay.height/2)))
                 canvas.alpha_composite(overlay,(ox,oy))
-        keyed = keyed_frame(canvas)
-        self.photo = ImageTk.PhotoImage(keyed)
-        self.label.config(image=self.photo)
+        self.photo = canvas
+        self.layered.draw(canvas)
         self.app.frame_cache[key] = self.photo
         self.render_key = key
 
@@ -1487,6 +1488,7 @@ class App:
             except tk.TclError: pass
         if self.analyzer: self.analyzer.stop(); self.analyzer=None
         if self.tray: self.tray.stop()
+        for sprite in self.sprites: sprite.layered.close()
         self.root.destroy()
 
     def make_sprite(self, image='', size=240, x=800, y=250, loading_x=85, loading_y=12):
@@ -1737,6 +1739,7 @@ class App:
         sprite=next((s for s in self.sprites if s.id==sprite_id),None)
         if sprite:
             if sprite.notice_window: sprite.notice_window.destroy()
+            sprite.layered.close()
             sprite.win.destroy(); self.sprites.remove(sprite)
             if self.selected_id==sprite_id: self.selected_id=self.sprites[0].id if self.sprites else None
             self.prune_image_cache(); self.refresh_sprite_list(); self.sync_loading_position(); self.save()
