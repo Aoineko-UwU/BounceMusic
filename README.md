@@ -105,5 +105,3 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 - [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch)：通过 WASAPI 回环获取播放设备的输出声音。
 - [Microsoft Windows 媒体会话 API](https://learn.microsoft.com/en-us/uwp/api/windows.media.control.globalsystemmediatransportcontrolssessionmanager)：可用时读取播放器的播放状态与曲目信息。
 - [librosa 节奏分析教程](https://librosa.org/doc/latest/auto_tutorials/01-intro/06-rhythm.html)：起音、速度与节拍位置分析的思路参考；BounceMusic 采用自己的实时实现，**不依赖** librosa 运行。
-
-项目作者：葵猫猫（[B站](https://space.bilibili.com/200696277) · [GitHub](https://github.com/Aoineko-UwU)）。这是 AI 辅助开发的个人项目；遇到问题或有改进建议，欢迎在 [Issues](https://github.com/Aoineko-UwU/BounceMusic/issues) 反馈。
